@@ -43,6 +43,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"k8s.io/klog/v2"
+	"github.com/intel/geopm/geopmdgo"
 )
 
 const (
@@ -106,6 +107,20 @@ func healthProbe(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		klog.Fatalf("%s", fmt.Sprintf("failed to write response: %v", err))
 	}
+}
+
+func useGEOPM() bool {
+	signalNames, err := geopmdgo.SignalNames()
+	if err != nil {
+		klog.Errorf("Failed to get signal names: %v", err)
+		return false
+	}
+	for _, name := range signalNames {
+		if name == "CPU_ENERGY" || name == "GPU_ENERGY" {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -174,13 +189,22 @@ func main() {
 		defer accelerator.Shutdown()
 	}
 
-	bpfExporter, err := bpf.NewExporter()
-	if err != nil {
-		klog.Fatalf("failed to create eBPF exporter: %v", err)
-	}
-	defer bpfExporter.Detach()
+	var m *manager.Manager
+	var err error
 
-	m := manager.New(bpfExporter)
+	if useGEOPM() {
+		klog.Infof("Using GEOPM for telemetry collection")
+		m, err = manager.NewGEOPMManager()
+	} else {
+		klog.Infof("Using eBPF for telemetry collection")
+		bpfExporter, err := bpf.NewExporter()
+		if err != nil {
+			klog.Fatalf("failed to create eBPF exporter: %v", err)
+		}
+		defer bpfExporter.Detach()
+		m = manager.New(bpfExporter)
+	}
+
 	if m == nil {
 		klog.Fatal("could not create a collector manager")
 	}
