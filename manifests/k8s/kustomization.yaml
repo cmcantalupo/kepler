@@ -17,3 +17,16 @@ resources:
 # to enable redfish functionality with sushy-static dependency
 # patches:
 #   - path: patches/enable-redfish.yaml
+
+# NOTE: To enable resctrl/AET power monitoring, uncomment ONE of the following patches.
+# Requires kernel with Application Energy Telemetry (AET) support and
+# resctrl filesystem mounted at /sys/fs/resctrl.
+#
+# ACTIVE MODE: Kepler creates and manages resctrl groups (requires write access)
+# patches:
+#   - path: patches/enable-resctrl.yaml
+#
+# PASSIVE MODE: Kepler discovers existing groups created by external orchestrator (read-only)
+# Recommended for unprivileged deployments with an external resctrl manager
+# patches:
+#   - path: patches/enable-resctrl-passive.yaml

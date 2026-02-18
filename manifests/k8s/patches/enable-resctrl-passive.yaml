@@ -1,0 +1,40 @@
+# Patch to enable resctrl/AET power monitoring in PASSIVE mode.
+# In passive mode, Kepler discovers existing resctrl groups created by an
+# external orchestrator instead of creating them.
+#
+# Requirements:
+# - Intel CPU with AET support (Clearwater Forest Xeon or later)
+# - resctrl filesystem must be mounted at /sys/fs/resctrl
+# - External orchestrator must create groups named with pod UUIDs
+# - Kepler needs read-only access to /sys/fs/resctrl
+#
+# Benefits of passive mode:
+# - No write access to resctrl needed
+# - Can be used with unprivileged containers when the DaemonSet
+#   securityContext is configured accordingly (this patch does not
+#   modify securityContext)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kepler
+  namespace: kepler
+spec:
+  template:
+    spec:
+      containers:
+        - name: kepler
+          args:
+            - --config.file=/etc/kepler/config.yaml
+            - --kube.enable
+            - --kube.node-name=$(NODE_NAME)
+            - --experimental.resctrl.enabled
+            - --experimental.resctrl.passive-mode
+          volumeMounts:
+            - name: resctrl
+              mountPath: /sys/fs/resctrl
+              readOnly: true
+      volumes:
+        - name: resctrl
+          hostPath:
+            path: /sys/fs/resctrl
+            type: Directory

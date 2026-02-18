@@ -22,7 +22,7 @@ import (
 //   - Active mode: creates and manages mon_groups under /sys/fs/resctrl,
 //     assigning PIDs to monitoring groups for per-pod energy tracking.
 //   - Passive mode: discovers existing UUID-named mon_groups created by
-//     an external daemon (e.g., RDT or a custom controller).
+//     an external orchestrator (e.g., a platform-level resource manager).
 //
 // Only core energy (from mon_PERF_PKG_*/core_energy) is read.
 // MBM bandwidth metrics are intentionally omitted.
