@@ -20,9 +20,9 @@ type mockDirEntry struct {
 }
 
 func (m mockDirEntry) Name() string               { return m.name }
-func (m mockDirEntry) IsDir() bool                 { return m.isDir }
-func (m mockDirEntry) Type() fs.FileMode           { return 0 }
-func (m mockDirEntry) Info() (fs.FileInfo, error)   { return nil, nil }
+func (m mockDirEntry) IsDir() bool                { return m.isDir }
+func (m mockDirEntry) Type() fs.FileMode          { return 0 }
+func (m mockDirEntry) Info() (fs.FileInfo, error) { return nil, nil }
 
 // mockFileInfo implements os.FileInfo for testing
 type mockFileInfo struct {
@@ -30,25 +30,25 @@ type mockFileInfo struct {
 	isDir bool
 }
 
-func (m mockFileInfo) Name() string      { return m.name }
-func (m mockFileInfo) Size() int64       { return 0 }
-func (m mockFileInfo) Mode() fs.FileMode { return 0o644 }
+func (m mockFileInfo) Name() string       { return m.name }
+func (m mockFileInfo) Size() int64        { return 0 }
+func (m mockFileInfo) Mode() fs.FileMode  { return 0o644 }
 func (m mockFileInfo) ModTime() time.Time { return time.Time{} }
-func (m mockFileInfo) IsDir() bool       { return m.isDir }
-func (m mockFileInfo) Sys() any          { return nil }
+func (m mockFileInfo) IsDir() bool        { return m.isDir }
+func (m mockFileInfo) Sys() any           { return nil }
 
 // mockResctrlFS is a mock resctrlFSReader for unit testing.
 type mockResctrlFS struct {
-	files      map[string]string    // path → contents
-	dirs       map[string][]os.DirEntry
-	statErr    map[string]error     // path → error from Stat
-	readErr    map[string]error     // path → error from ReadFile
-	mkdirErr   map[string]error     // path → error from MkdirAll
-	removeErr  map[string]error     // path → error from RemoveAll
-	writeErr   map[string]error     // path → error from WriteFile
-	written    map[string]string    // tracks writes: path → data
-	removed    []string             // tracks removed paths
-	mkdirs     []string             // tracks created dirs
+	files     map[string]string // path → contents
+	dirs      map[string][]os.DirEntry
+	statErr   map[string]error  // path → error from Stat
+	readErr   map[string]error  // path → error from ReadFile
+	mkdirErr  map[string]error  // path → error from MkdirAll
+	removeErr map[string]error  // path → error from RemoveAll
+	writeErr  map[string]error  // path → error from WriteFile
+	written   map[string]string // tracks writes: path → data
+	removed   []string          // tracks removed paths
+	mkdirs    []string          // tracks created dirs
 }
 
 func newMockFS() *mockResctrlFS {
