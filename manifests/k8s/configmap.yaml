@@ -63,3 +63,7 @@ data:
         enabled: false
         idlePower: 0 # GPU idle power in Watts (0 = auto-detect)
         dcgmEndpoint: "" # dcgm-exporter metrics URL for MIG (auto-discovered if empty)
+      resctrl:
+        enabled: false # Enable experimental resctrl/AET per-workload core energy monitoring
+        basePath: /sys/fs/resctrl # Resctrl filesystem mount point
+        passiveMode: false # Discover existing mon_groups instead of creating them
