@@ -166,6 +166,8 @@ func (pm *PowerMonitor) calculateNodePower(prevNode, newNode *Node) error {
 			Power:       power,
 			ActivePower: activePower,
 			IdlePower:   idlePower,
+
+			deltaEnergy: deltaEnergy,
 		}
 	}
 

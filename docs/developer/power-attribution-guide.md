@@ -10,7 +10,8 @@ processes, containers, VMs, and pods running on a system.
 3. [Attribution Examples](#attribution-examples)
 4. [Implementation Overview](#implementation-overview)
 5. [Code Reference](#code-reference)
-6. [Limitations and Considerations](#limitations-and-considerations)
+6. [Resctrl/AET Attribution](#resctrlAET-attribution)
+7. [Limitations and Considerations](#limitations-and-considerations)
 
 ## Bird's Eye View
 
@@ -371,6 +372,185 @@ type NodeUsage struct {
 }
 ```
 
+## Resctrl/AET Attribution
+
+> **User guide**: See [docs/user/resctrl-aet.md](../user/resctrl-aet.md) for
+> configuration, deployment, and metrics.
+
+### Overview
+
+On Intel Xeon processors with Application Energy Telemetry (AET) support,
+Kepler can read per-monitoring-group core energy counters from the Linux resctrl
+filesystem instead of estimating core energy from CPU time ratios. This is an
+experimental feature enabled via `--experimental.resctrl.enabled`.
+
+AET counters are exposed at:
+```
+/sys/fs/resctrl/mon_groups/<group>/mon_data/mon_PERF_PKG_*/core_energy
+```
+
+Each `mon_PERF_PKG_*` directory corresponds to a CPU package (socket). The
+`core_energy` file contains a cumulative Joule counter of core energy consumed
+by the processes assigned to that monitoring group.
+
+### Three-Phase Attribution Pipeline
+
+When resctrl is enabled, pod power attribution in `calculatePodPower()` follows
+a three-phase pipeline instead of the single ratio-model pass:
+
+#### Phase 1 — Read Deltas (`resctrlReadDeltas`)
+
+**File**: `internal/monitor/resctrl.go`
+
+For each pod with a resctrl monitoring group:
+
+1. Read current cumulative AET counter per package
+2. Compute delta against previous snapshot's baseline
+3. Handle counter wraparound (negative delta → treat as zero)
+4. **Seed-only detection**: A pod's first successful AET read is
+   baseline-only — no delta is produced. The pod uses standard ratio
+   attribution for that cycle and contributes meaningful deltas starting
+   from the next cycle.
+
+The result is `coreDelta[podID][pkgIdx]` in raw Joules.
+
+```go
+// Seed detection: only contribute deltas when a previous baseline exists
+if hasPrevBaseline {
+    ra.coreDelta[id] = podDeltas
+    for pkgIdx, d := range podDeltas {
+        ra.totalCoreByPkg[pkgIdx] += d
+    }
+}
+```
+
+The `allPodsTracked` flag is set when:
+- A previous snapshot exists (`prev != nil`)
+- Every running pod has a resctrl group
+- Every tracked pod contributed deltas (had a valid baseline)
+
+#### Phase 2 — Compute Budget (`resctrlComputeBudget`)
+
+**File**: `internal/monitor/resctrl.go`
+
+Two modes are selected automatically based on `allPodsTracked`:
+
+**All-resctrl mode** (`computeBudgetAllResctrl`):
+
+When every pod has AET data, raw deltas are used against the total RAPL
+`deltaEnergy` (not scaled by `UsageRatio`):
+
+```text
+residual = max(0, RAPL_deltaEnergy − sum(raw_AET_core))
+normFactor = min(1.0, RAPL_deltaEnergy / sum(raw_AET_core))
+```
+
+The residual includes true uncore energy, idle energy, and energy from non-pod
+system processes (kernel threads, etc.). Because it is typically a small
+fraction of total package energy, the `cpuTimeRatio` split of the residual
+has minimal accuracy impact.
+
+**Mixed mode** (`computeBudgetMixed`):
+
+When some pods lack resctrl data:
+
+```text
+scaled_core = raw_AET_core × cpuUsageRatio
+uncore = max(0, RAPL_activeEnergy − sum(scaled_core))
+normFactor = min(1.0, RAPL_activeEnergy / sum(scaled_core))
+```
+
+Raw AET deltas are scaled by `cpuUsageRatio` to match `activeEnergy` units,
+ensuring both resctrl and ratio pods share a consistent energy budget.
+
+**Normalization**: In both modes, when AET core totals exceed the RAPL budget
+(possible due to measurement timing), the uncore budget is zero and
+`coreNormFactor` scales pod core values down so their sum equals the RAPL
+budget. This preserves relative AET proportions while enforcing conservation.
+
+#### Phase 3 — Attribute (`calculatePodPower` loop)
+
+**File**: `internal/monitor/pod.go`
+
+For each pod × zone combination, one of three branches executes:
+
+| Condition | Branch | Energy Formula |
+|-----------|--------|----------------|
+| Pod has AET deltas + package zone | Resctrl core | `normCore + uncoreShare × cpuTimeRatio` |
+| Pod lacks AET deltas + package zone + resctrl active | Uncore-only | `uncoreShare × cpuTimeRatio` |
+| Non-package zone or no resctrl | Pure ratio | `activeEnergy × cpuTimeRatio` |
+
+```go
+// Resctrl pod on package zone:
+normCore := coreDeltaJoules * ra.coreNormFactor[zone]
+uncoreShareJoules := ra.uncoreEnergy[zone] * cpuTimeRatio
+activeEnergy = Energy((normCore + uncoreShareJoules) * float64(Joule))
+
+// Non-resctrl pod on package zone (mixed mode):
+activeEnergy = Energy(ra.uncoreEnergy[zone] * cpuTimeRatio * float64(Joule))
+
+// Non-package zone or no resctrl data:
+activeEnergy = Energy(float64(nodeZoneUsage.activeEnergy) * cpuTimeRatio)
+```
+
+Non-resctrl pods receive only the uncore budget share on package zones (not
+the full package energy). This ensures energy conservation — measured AET
+core plus shared uncore sums to at most the RAPL budget.
+
+### Attribution Source Tracking
+
+Each pod carries an `AttributionSource` field:
+- `AttributionRatio` — energy computed from CPU time ratios (default, and
+  used during seed-only cycles even for pods with resctrl groups)
+- `AttributionResctrl` — energy computed using AET hardware measurements
+  (set only when the pod contributed meaningful AET deltas)
+
+### Multi-Package and Aggregated Zones
+
+RAPL zones can be per-package (`package-0`, `package-1`) or aggregated
+(`package`). The implementation handles both:
+
+- **Per-package zones**: Match AET data by package index extracted from
+  the zone name via `raplZonePackageIndex()`
+- **Aggregated zones**: Sum AET data across all packages
+
+Similarly, AET zone names (`mon_PERF_PKG_0`) are mapped to package indices
+via `aetZonePackageIndex()`.
+
+### Resctrl Group Lifecycle
+
+**File**: `internal/monitor/resctrl.go` (management functions)
+
+- **Active mode**: `resctrlSyncGroups()` creates groups for new pods, adds
+  PIDs, and deletes groups for terminated pods. Stale groups that fail to
+  delete are retained for retry on the next cycle.
+- **Passive mode**: `resctrlDiscoverGroups()` lists existing `mon_groups`
+  and matches names against running pod UUIDs.
+
+### Key Data Structures
+
+```go
+type resctrlAttribution struct {
+    coreDelta      map[string]map[int]float64  // [podID][pkgIdx] → raw Joules
+    totalCoreByPkg map[int]float64             // [pkgIdx] → sum across pods
+    uncoreEnergy   map[EnergyZone]float64      // [zone] → residual Joules
+    coreNormFactor map[EnergyZone]float64      // [zone] → conservation factor
+    allPodsTracked bool                        // all-resctrl mode flag
+    pods           map[string]*Pod             // pre-built pod entries
+}
+```
+
+The `Pod` struct carries resctrl state:
+- `ResctrlCoreEnergyByPkg map[int]float64` — cumulative AET counter per package
+- `AttributionSource` — `AttributionRatio` or `AttributionResctrl`
+
+### Interaction with Existing Attribution
+
+The resctrl pipeline is additive — it only affects package zones for pods
+with resctrl data. All other attribution (processes, containers, VMs,
+non-package pod zones) continues to use the standard CPU-time ratio model
+unchanged.
+
 ## Limitations and Considerations
 
 ### CPU Power States and Attribution Accuracy
@@ -450,6 +630,16 @@ Reality: Process B likely consumed more during its burst due to:
 - **Relative comparisons** between similar workload types
 - **Trend analysis** over longer time periods
 
+### How Resctrl/AET Improves Accuracy
+
+On supported hardware, the [resctrl/AET attribution](#resctrlAET-attribution)
+path directly addresses several limitations above by replacing CPU-time-based
+core energy estimates with hardware-measured per-workload core energy. This
+captures the actual power impact of different instruction mixes, frequency
+scaling, and C-state behavior for the core component. The residual (uncore +
+idle) still uses the CPU time ratio approximation but is typically a small
+fraction of total package energy.
+
 ### When to Exercise Caution
 
 - **Mixed workload environments** with varying compute vs I/O patterns
@@ -465,6 +655,9 @@ Reality: Process B likely consumed more during its burst due to:
 - `kepler_container_cpu_watts{}`: Container-level power
 - `kepler_vm_cpu_watts{}`: Virtual machine power
 - `kepler_pod_cpu_watts{}`: Kubernetes pod power
+- `kepler_pod_resctrl_core_energy_joules_total{}`: Raw AET core energy
+  (experimental, only on supported hardware — see
+  [Resctrl/AET Attribution](#resctrlAET-attribution))
 
 ## Conclusion
 
@@ -474,8 +667,7 @@ attribution has inherent limitations due to modern CPU complexity, it offers a
 good balance between accuracy, simplicity, and performance overhead for most
 monitoring and optimization use cases.
 
-The implementation ensures energy conservation, fair proportional distribution,
-and thread-safe concurrent access while minimizing the overhead of continuous
-power monitoring. Understanding both the capabilities and limitations helps
-users make informed decisions about when and how to rely on Kepler's power
-attribution metrics.
+On Intel Xeon processors with AET support, the experimental resctrl/AET
+attribution path replaces CPU-time estimates with hardware-measured per-workload
+core energy, significantly improving accuracy for workloads with diverse power
+profiles.

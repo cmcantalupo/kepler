@@ -23,6 +23,18 @@ const (
 	Watt  = device.Watt
 )
 
+// AttributionSource indicates how a pod's energy was attributed.
+type AttributionSource string
+
+const (
+	// AttributionRatio means energy was attributed using CPU time ratio (existing Kepler model).
+	AttributionRatio AttributionSource = "ratio"
+
+	// AttributionResctrl means core energy was directly measured via resctrl/AET,
+	// and uncore energy was attributed using CPU time ratio.
+	AttributionResctrl AttributionSource = "resctrl"
+)
+
 // NodeUsage contains energy consumption data of a node. This is different to Usage in that it has idle/active split
 type NodeUsage struct {
 	EnergyTotal Energy // Cumulative joules counter
@@ -37,6 +49,11 @@ type NodeUsage struct {
 
 	// NOTE: activeEnergy is an internal variable that is used to calculate Resource's energy
 	activeEnergy Energy // Energy used by the Resource running
+
+	// deltaEnergy is the total energy delta for this zone in the current collection
+	// cycle, before the active/idle split. It is used internally by the attribution
+	// logic (for example, to derive active and idle energy components).
+	deltaEnergy Energy
 }
 
 // Usage contains energy consumption data of workloads (Process, Container, VM)
@@ -202,6 +219,13 @@ type Pod struct {
 	// GPU power attribution (in Watts). Aggregated from container-level GPU power.
 	GPUPower       float64
 	GPUEnergyTotal Energy // Cumulative GPU energy, aggregated from containers
+
+	// Resctrl/AET fields (only populated when resctrl is enabled)
+	// ResctrlCoreEnergyByPkg maps package index to cumulative core energy from
+	// AET (Joules, float64). Each entry corresponds to one mon_PERF_PKG zone.
+	// Keeping per-package values avoids double-counting on multi-socket systems.
+	ResctrlCoreEnergyByPkg map[int]float64
+	AttributionSource      AttributionSource // How this pod's energy was attributed
 }
 
 func (p *Pod) Clone() *Pod {
@@ -212,6 +236,10 @@ func (p *Pod) Clone() *Pod {
 	ret := *p
 	ret.Zones = make(ZoneUsageMap, len(p.Zones))
 	maps.Copy(ret.Zones, p.Zones)
+	if p.ResctrlCoreEnergyByPkg != nil {
+		ret.ResctrlCoreEnergyByPkg = make(map[int]float64, len(p.ResctrlCoreEnergyByPkg))
+		maps.Copy(ret.ResctrlCoreEnergyByPkg, p.ResctrlCoreEnergyByPkg)
+	}
 	return &ret
 }
 
@@ -268,6 +296,16 @@ type Snapshot struct {
 
 	// GPU power statistics for debugging/monitoring (optional, nil if no GPU)
 	GPUStats []GPUDeviceStats
+
+	// TotalResctrlCoreEnergyByPkg maps package index to the sum of resctrl
+	// core energy deltas (Joules, float64) across all pods with resctrl
+	// monitoring groups for that package in the current collection cycle.
+	//
+	// When all pods have resctrl groups (all-resctrl mode), these are raw
+	// AET deltas and the uncore residual is computed from deltaEnergy.
+	// When some pods lack resctrl groups (mixed mode), these are scaled by
+	// cpuUsageRatio for consistency with nodeZoneUsage.activeEnergy.
+	TotalResctrlCoreEnergyByPkg map[int]float64
 }
 
 // NewSnapshot creates a new Snapshot instance
@@ -343,6 +381,12 @@ func (s *Snapshot) Clone() *Snapshot {
 	if len(s.GPUStats) > 0 {
 		clone.GPUStats = make([]GPUDeviceStats, len(s.GPUStats))
 		copy(clone.GPUStats, s.GPUStats)
+	}
+
+	// Copy per-package resctrl totals
+	if len(s.TotalResctrlCoreEnergyByPkg) > 0 {
+		clone.TotalResctrlCoreEnergyByPkg = make(map[int]float64, len(s.TotalResctrlCoreEnergyByPkg))
+		maps.Copy(clone.TotalResctrlCoreEnergyByPkg, s.TotalResctrlCoreEnergyByPkg)
 	}
 
 	return clone

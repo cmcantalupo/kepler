@@ -1,0 +1,33 @@
+# Patch to enable resctrl/AET power monitoring in ACTIVE mode.
+# In active mode, Kepler creates and manages resctrl monitor groups for each pod.
+#
+# Requirements:
+# - Intel CPU with AET support (Clearwater Forest Xeon or later)
+# - resctrl filesystem mounted at /sys/fs/resctrl
+# - Kepler needs write access to create/delete monitor groups
+#
+# For read-only / unprivileged deployments, consider using passive mode instead:
+# See patches/enable-resctrl-passive.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kepler
+  namespace: kepler
+spec:
+  template:
+    spec:
+      containers:
+        - name: kepler
+          args:
+            - --config.file=/etc/kepler/config.yaml
+            - --kube.enable
+            - --kube.node-name=$(NODE_NAME)
+            - --experimental.resctrl.enabled
+          volumeMounts:
+            - name: resctrl
+              mountPath: /sys/fs/resctrl
+      volumes:
+        - name: resctrl
+          hostPath:
+            path: /sys/fs/resctrl
+            type: Directory

@@ -184,6 +184,17 @@ func createServices(logger *slog.Logger, cfg *config.Config) ([]service.Service,
 		pmOpts = append(pmOpts, monitor.WithGPUPowerMeters(gpuMeters))
 	}
 
+	// Create resctrl meter if enabled (experimental feature)
+	resctrlMeter := createResctrlMeter(logger, cfg)
+	if resctrlMeter != nil {
+		pmOpts = append(pmOpts, monitor.WithResctrlMeter(resctrlMeter))
+		passiveMode := false
+		if cfg.Experimental != nil && cfg.Experimental.Resctrl.PassiveMode != nil {
+			passiveMode = *cfg.Experimental.Resctrl.PassiveMode
+		}
+		pmOpts = append(pmOpts, monitor.WithResctrlPassiveMode(passiveMode))
+	}
+
 	pm := monitor.NewPowerMonitor(cpuPowerMeter, pmOpts...)
 
 	// Create Redfish service if enabled (experimental feature)
@@ -381,4 +392,33 @@ func createGPUMeters(logger *slog.Logger, cfg *config.Config) []gpu.GPUPowerMete
 	}
 
 	return meters
+}
+
+// createResctrlMeter creates and initializes the resctrl/AET power meter if the
+// experimental resctrl feature is enabled. Returns nil if disabled or Init fails
+// (soft-fail: the system may not have AET support).
+func createResctrlMeter(logger *slog.Logger, cfg *config.Config) device.ResctrlPowerMeter {
+	if !cfg.IsFeatureEnabled(config.ExperimentalResctrlFeature) {
+		logger.Info("resctrl/AET feature disabled")
+		return nil
+	}
+
+	var resctrlOpts []device.ResctrlOption
+	resctrlOpts = append(resctrlOpts, device.WithResctrlLogger(logger))
+
+	if cfg.Experimental != nil && cfg.Experimental.Resctrl.BasePath != "" {
+		resctrlOpts = append(resctrlOpts, device.WithResctrlBasePath(cfg.Experimental.Resctrl.BasePath))
+	}
+
+	meter := device.NewResctrlPowerMeter(resctrlOpts...)
+	if err := meter.Init(); err != nil {
+		logger.Warn("resctrl/AET init failed (AET may not be available on this CPU)",
+			"error", err)
+		return nil
+	}
+
+	logger.Info("resctrl/AET power meter initialized",
+		"zones", meter.Zones())
+
+	return meter
 }

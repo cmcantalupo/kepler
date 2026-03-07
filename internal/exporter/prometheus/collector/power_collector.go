@@ -60,10 +60,11 @@ type PowerCollector struct {
 	vmCPUWattsDescriptor  *prometheus.Desc
 
 	// Pod power metrics
-	podCPUJoulesDescriptor *prometheus.Desc
-	podCPUWattsDescriptor  *prometheus.Desc
-	podGPUWattsDescriptor  *prometheus.Desc
-	podGPUJoulesDescriptor *prometheus.Desc
+	podCPUJoulesDescriptor               *prometheus.Desc
+	podCPUWattsDescriptor                *prometheus.Desc
+	podGPUWattsDescriptor                *prometheus.Desc
+	podGPUJoulesDescriptor               *prometheus.Desc
+	podResctrlCoreEnergyJoulesDescriptor *prometheus.Desc // resctrl/AET core energy (emitted for pods with resctrl counter data, which may be stale during transient read failures)
 
 	// GPU device power metrics
 	gpuTotalWattsDescriptor   *prometheus.Desc
@@ -157,6 +158,10 @@ func NewPowerCollector(monitor PowerDataProvider, nodeName string, logger *slog.
 		podCPUWattsDescriptor:  wattsDesc("pod", "cpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state", zone}),
 		podGPUJoulesDescriptor: joulesDesc("pod", "gpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state"}),
 		podGPUWattsDescriptor:  wattsDesc("pod", "gpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state"}),
+		podResctrlCoreEnergyJoulesDescriptor: prometheus.NewDesc(
+			prometheus.BuildFQName(keplerNS, "pod", "resctrl_core_energy_joules_total"),
+			"Raw cumulative core energy from resctrl/AET hardware in joules (unscaled hardware counter; only present for pods with resctrl monitoring groups)",
+			[]string{podID, "pod_name", "pod_namespace", "state"}, prometheus.Labels{nodeNameLabel: nodeName}),
 
 		// GPU device power metrics (node-level)
 		gpuTotalWattsDescriptor: prometheus.NewDesc(
@@ -233,6 +238,7 @@ func (c *PowerCollector) Describe(ch chan<- *prometheus.Desc) {
 		ch <- c.podCPUWattsDescriptor
 		ch <- c.podGPUJoulesDescriptor
 		ch <- c.podGPUWattsDescriptor
+		ch <- c.podResctrlCoreEnergyJoulesDescriptor
 	}
 
 	// GPU device power metrics (node-level)
@@ -551,6 +557,24 @@ func (c *PowerCollector) collectPodMetrics(ch chan<- prometheus.Metric, state st
 				c.podGPUJoulesDescriptor,
 				prometheus.CounterValue,
 				pod.GPUEnergyTotal.Joules(),
+				id, pod.Name, pod.Namespace, state,
+			)
+		}
+
+		// Resctrl/AET core energy metric — emitted when resctrl-derived core
+		// energy data is available in ResctrlCoreEnergyByPkg. During transient
+		// resctrl read failures, attribution may fall back to CPU-ratio while
+		// still carrying forward previously read resctrl values, so this metric
+		// may briefly reflect stale hardware-measured core energy.
+		if len(pod.ResctrlCoreEnergyByPkg) > 0 {
+			var totalCoreEnergyJoules float64
+			for _, e := range pod.ResctrlCoreEnergyByPkg {
+				totalCoreEnergyJoules += e
+			}
+			ch <- prometheus.MustNewConstMetric(
+				c.podResctrlCoreEnergyJoulesDescriptor,
+				prometheus.CounterValue,
+				totalCoreEnergyJoules,
 				id, pod.Name, pod.Namespace, state,
 			)
 		}
