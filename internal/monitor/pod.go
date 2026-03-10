@@ -15,6 +15,19 @@ func (pm *PowerMonitor) firstPodRead(snapshot *Snapshot) error {
 	zones := snapshot.Node.Zones
 	nodeCPUTimeDelta := pm.resources.Node().ProcessTotalCPUTimeDelta
 
+	// Seed root-level core energy baseline for the three-pool decomposition.
+	if pm.resctrlEnabled() {
+		rootCoreEnergy, err := pm.resctrl.ReadGroupEnergyByZone("")
+		if err == nil && len(rootCoreEnergy) > 0 {
+			snapshot.Node.AETCoreBaseline = make(map[int]float64, len(rootCoreEnergy))
+			for aetZone, energy := range rootCoreEnergy {
+				if pkgIdx, ok := aetZonePackageIndex(aetZone); ok {
+					snapshot.Node.AETCoreBaseline[pkgIdx] = energy
+				}
+			}
+		}
+	}
+
 	for id, p := range running {
 		pod := newPod(p, zones)
 
@@ -72,13 +85,12 @@ func (pm *PowerMonitor) firstPodRead(snapshot *Snapshot) error {
 //     confined to the (typically small) residual, preserving AET fidelity.
 //
 // Mixed mode (some pods lack resctrl groups):
-//   - Raw AET deltas are scaled by cpuUsageRatio to match RAPL activeEnergy units.
-//   - Uncore = RAPL_active - sum(scaled_AET_core).
-//   - Resctrl pods: normalized core + uncore share by cpuTimeRatio.
-//   - Ratio-only pods: uncore share only (no core energy — they have no AET data).
+//   - Uses root-level AET core_energy to decompose RAPL into three pools:
+//     1. Tracked core: mon_group core deltas → directly to AET pods
+//     2. Untracked core: (rootCore - Σ monGroupCore) → shared among non-AET pods
+//     3. Uncore: (RAPL - rootCore) → shared among ALL pods by cpuTimeRatio
+//   - This guarantees energy conservation: the three pools sum to RAPL delta.
 //   - Non-package zones (DRAM, etc.): all pods use pure cpuTimeRatio model.
-//   - When no pods have resctrl data for a zone, the full RAPL active energy is
-//     available as uncore budget and all pods use the ratio model (same as before).
 func (pm *PowerMonitor) calculatePodPower(prev, newSnapshot *Snapshot) error {
 	// Clear terminated workloads if snapshot has been exported
 	if pm.exported.Load() {
@@ -122,17 +134,21 @@ func (pm *PowerMonitor) calculatePodPower(prev, newSnapshot *Snapshot) error {
 	// ---- Phase 1 & 2: Read AET deltas and compute energy budgets ----
 	// Resctrl attribution is handled in resctrl.go. Two modes:
 	//   allPodsTracked=true:  raw AET deltas vs total RAPL deltaEnergy (no UsageRatio scaling)
-	//   allPodsTracked=false: scaled AET deltas vs RAPL activeEnergy (backward-compatible hybrid)
+	//   allPodsTracked=false: mixed mode — three-pool decomposition using root core_energy
 	var ra *resctrlAttribution
 	if pm.resctrlEnabled() {
 		ra = pm.resctrlReadDeltas(prev, newSnapshot.Node.Zones, pods)
-		ra.resctrlComputeBudget(newSnapshot.Node.Zones, newSnapshot.Node.UsageRatio)
+		ra.resctrlComputeBudget(newSnapshot.Node.Zones)
 		// Adopt pod entries created during delta reading (with resctrl metadata).
 		for id, pod := range ra.pods {
 			podMap[id] = pod
 		}
 		if len(ra.totalCoreByPkg) > 0 {
 			newSnapshot.TotalResctrlCoreEnergyByPkg = ra.totalCoreByPkg
+		}
+		// Store root core energy cumulative on the node for next cycle's baseline.
+		if ra.rootCoreCumulative != nil {
+			newSnapshot.Node.AETCoreBaseline = ra.rootCoreCumulative
 		}
 	}
 
@@ -192,12 +208,28 @@ func (pm *PowerMonitor) calculatePodPower(prev, newSnapshot *Snapshot) error {
 					activePower = Power(float64(activeEnergy) / float64(nodeZoneUsage.deltaEnergy) * float64(nodeZoneUsage.Power))
 				}
 			} else if hasResctrl && isPackageZone(zone) && len(ra.coreDelta) > 0 {
-				// Package zone without resctrl: share only the remaining package
-				// budget (uncoreEnergy) by CPU-time ratio. This preserves energy
-				// conservation — resctrl pods get measured core + uncore share,
-				// ratio pods share only what's left (the uncore portion).
-				uncoreShareJoules := ra.uncoreEnergy[zone] * cpuTimeRatio
-				activeEnergy = Energy(uncoreShareJoules * float64(Joule))
+				// Package zone without resctrl data: non-AET pod.
+				// Non-AET pods receive two shares:
+				//   1. Untracked core share: (rootCore - Σ monGroupCore) × (podCPU / nonAETCPU)
+				//   2. Uncore share: (RAPL - rootCore) × cpuTimeRatio (same as AET pods)
+				// The denominator for untracked core includes all non-AET CPU time
+				// (non-AET pods + system processes), so system threads get their
+				// implicit share without it being attributed to pods.
+				var aetCPUTotal float64
+				for aetID := range ra.coreDelta {
+					if aetPod, ok := pods.Running[aetID]; ok {
+						aetCPUTotal += aetPod.CPUTimeDelta
+					}
+				}
+				nonAETCPUTotal := nodeCPUTimeDelta - aetCPUTotal
+				var podShareJoules float64
+				// Untracked core share
+				if nonAETCPUTotal > 0 && ra.untrackedCore[zone] > 0 {
+					podShareJoules += ra.untrackedCore[zone] * (p.CPUTimeDelta / nonAETCPUTotal)
+				}
+				// Uncore share (same pool as AET pods)
+				podShareJoules += ra.uncoreEnergy[zone] * cpuTimeRatio
+				activeEnergy = Energy(podShareJoules * float64(Joule))
 				if nodeZoneUsage.activeEnergy > 0 {
 					activePower = Power(float64(activeEnergy) / float64(nodeZoneUsage.activeEnergy) * float64(nodeZoneUsage.ActivePower))
 				} else if nodeZoneUsage.deltaEnergy > 0 {

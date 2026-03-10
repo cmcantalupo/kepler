@@ -76,6 +76,13 @@ type Node struct {
 	Timestamp  time.Time        // Timestamp of the last measurement
 	UsageRatio float64          // ratio of usage
 	Zones      NodeZoneUsageMap // Map of zones to usage
+
+	// AETCoreBaseline maps package index to the root-level cumulative
+	// resctrl core_energy counter (Joules). This is read from the root
+	// mon_data (not from any mon_group) and represents total system core
+	// energy as measured by AET. Used in mixed mode to decompose RAPL
+	// into tracked core, untracked core, and uncore pools.
+	AETCoreBaseline map[int]float64
 }
 
 func (n *Node) Clone() *Node {
@@ -85,6 +92,10 @@ func (n *Node) Clone() *Node {
 	ret := *n
 	ret.Zones = make(NodeZoneUsageMap, len(n.Zones))
 	maps.Copy(ret.Zones, n.Zones)
+	if n.AETCoreBaseline != nil {
+		ret.AETCoreBaseline = make(map[int]float64, len(n.AETCoreBaseline))
+		maps.Copy(ret.AETCoreBaseline, n.AETCoreBaseline)
+	}
 	return &ret
 }
 
@@ -225,7 +236,8 @@ type Pod struct {
 	// AET (Joules, float64). Each entry corresponds to one mon_PERF_PKG zone.
 	// Keeping per-package values avoids double-counting on multi-socket systems.
 	ResctrlCoreEnergyByPkg map[int]float64
-	AttributionSource      AttributionSource // How this pod's energy was attributed
+
+	AttributionSource AttributionSource // How this pod's energy was attributed
 }
 
 func (p *Pod) Clone() *Pod {

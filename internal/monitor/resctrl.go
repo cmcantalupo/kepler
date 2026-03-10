@@ -20,17 +20,31 @@ type resctrlAttribution struct {
 	coreDelta map[string]map[int]float64
 
 	// totalCoreByPkg[pkgIndex] = sum of coreDelta across all pods for a package.
-	// In all-resctrl mode these are raw Joules; in mixed mode they are scaled
-	// by UsageRatio for consistency with activeEnergy.
 	totalCoreByPkg map[int]float64
 
-	// uncoreEnergy[zone] = residual energy (Joules) not accounted for by AET core.
-	// In all-resctrl mode: deltaEnergy - totalRawCore (includes idle + true uncore).
-	// In mixed mode:       activeEnergy - totalScaledCore (only active portion).
+	// rootCoreDelta[pkgIndex] = root-level core energy delta (total system) for
+	// this cycle. Read from /sys/fs/resctrl/mon_data/mon_PERF_PKG_*/core_energy.
+	// Represents the hardware-measured total core energy across all processes.
+	rootCoreDelta map[int]float64
+
+	// rootCoreCumulative[pkgIndex] = raw cumulative root core energy counter
+	// for this cycle. Saved to the Node's AETCoreBaseline for next cycle's
+	// delta computation.
+	rootCoreCumulative map[int]float64
+
+	// uncoreEnergy[zone] = energy not consumed by any core (Joules).
+	// Computed as RAPL_delta - rootCoreDelta. This is the true hardware-measured
+	// uncore energy (LLC, memory controller, IO, etc.). Shared by ALL pods
+	// via cpuTimeRatio.
 	uncoreEnergy map[EnergyZone]float64
 
 	// coreNormFactor[zone] = min(1.0, budget / totalCore) to ensure conservation.
 	coreNormFactor map[EnergyZone]float64
+
+	// untrackedCore[zone] = core energy consumed by processes not in any
+	// monitoring group (Joules). Computed as rootCoreDelta - sum(monGroupCore).
+	// Shared among non-AET pods by their relative CPU time.
+	untrackedCore map[EnergyZone]float64
 
 	// allPodsTracked is true when every running pod has a resctrl group, enabling
 	// the optimized path that uses raw AET deltas against total RAPL delta instead
@@ -59,9 +73,32 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 	ra := &resctrlAttribution{
 		coreDelta:      make(map[string]map[int]float64),
 		totalCoreByPkg: make(map[int]float64),
+		rootCoreDelta:  make(map[int]float64),
 		uncoreEnergy:   make(map[EnergyZone]float64),
 		coreNormFactor: make(map[EnergyZone]float64),
+		untrackedCore:  make(map[EnergyZone]float64),
 		pods:           make(map[string]*Pod, len(pods.Running)),
+	}
+
+	// Read root-level core energy for the three-pool decomposition.
+	rootCoreOK := false
+	rootCoreEnergy, rootErr := pm.resctrl.ReadGroupEnergyByZone("")
+	if rootErr == nil && len(rootCoreEnergy) > 0 {
+		rootCoreOK = true
+		// Compute root core energy delta from previous snapshot's baseline.
+		if prev != nil && prev.Node != nil && prev.Node.AETCoreBaseline != nil {
+			for aetZone, energy := range rootCoreEnergy {
+				pkgIdx, ok := aetZonePackageIndex(aetZone)
+				if !ok {
+					continue
+				}
+				if prevEnergy, hasPkg := prev.Node.AETCoreBaseline[pkgIdx]; hasPkg {
+					if energy >= prevEnergy {
+						ra.rootCoreDelta[pkgIdx] = energy - prevEnergy
+					}
+				}
+			}
+		}
 	}
 
 	resctrlCount := 0
@@ -78,13 +115,14 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 			// Preserve the last known cumulative resctrl core energy baseline so that
 			// future deltas remain correct once resctrl reads succeed again.
 			pod := newPod(pods.Running[id], nodeZones)
-			if prevPod, exists := prev.Pods[id]; exists && prevPod.ResctrlCoreEnergyByPkg != nil {
-				// Deep-copy to preserve snapshot immutability.
-				copied := make(map[int]float64, len(prevPod.ResctrlCoreEnergyByPkg))
-				for pkgIdx, energy := range prevPod.ResctrlCoreEnergyByPkg {
-					copied[pkgIdx] = energy
+			if prevPod, exists := prev.Pods[id]; exists {
+				if prevPod.ResctrlCoreEnergyByPkg != nil {
+					copied := make(map[int]float64, len(prevPod.ResctrlCoreEnergyByPkg))
+					for pkgIdx, energy := range prevPod.ResctrlCoreEnergyByPkg {
+						copied[pkgIdx] = energy
+					}
+					pod.ResctrlCoreEnergyByPkg = copied
 				}
-				pod.ResctrlCoreEnergyByPkg = copied
 			}
 			ra.pods[id] = pod
 			continue
@@ -101,6 +139,7 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 
 		podDeltas := make(map[int]float64, len(energyByZone))
 		podCumulative := make(map[int]float64, len(energyByZone))
+
 		for aetZone, energy := range energyByZone {
 			pkgIdx, ok := aetZonePackageIndex(aetZone)
 			if !ok {
@@ -109,14 +148,10 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 			podCumulative[pkgIdx] = energy
 
 			if hasPrevBaseline {
-				// Calculate per-package delta from previous snapshot.
-				// The counter can roll over, producing a negative delta;
-				// discard those — treat as zero for this cycle.
 				if prevEnergy, hasPkg := prevPod.ResctrlCoreEnergyByPkg[pkgIdx]; hasPkg {
 					if energy >= prevEnergy {
 						podDeltas[pkgIdx] = energy - prevEnergy
 					}
-					// else: counter wrapped or reset — treat delta as 0
 				}
 			}
 		}
@@ -133,14 +168,20 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 		// Stash the per-package cumulative counters; saved to the pod at the end.
 		pod := newPod(pods.Running[id], nodeZones)
 		pod.ResctrlCoreEnergyByPkg = podCumulative
-		// AttributionSource reflects how this cycle's energy was actually
-		// attributed. For seed-only cycles (no previous baseline), energy
-		// is still computed via the ratio/uncore-share model; mark resctrl
-		// only when AET deltas were used.
 		if hasPrevBaseline {
 			pod.AttributionSource = AttributionResctrl
 		}
 		ra.pods[id] = pod
+	}
+
+	// Store root core energy cumulative for next cycle's baseline.
+	if rootCoreOK {
+		ra.rootCoreCumulative = make(map[int]float64, len(rootCoreEnergy))
+		for aetZone, energy := range rootCoreEnergy {
+			if pkgIdx, ok := aetZonePackageIndex(aetZone); ok {
+				ra.rootCoreCumulative[pkgIdx] = energy
+			}
+		}
 	}
 
 	// All-resctrl is true when a previous snapshot exists, every running pod
@@ -154,7 +195,7 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 	return ra
 }
 
-// resctrlComputeBudget performs Phase 2: computes per-zone uncore energy budget
+// resctrlComputeBudget performs Phase 2: computes per-zone energy budgets
 // and core normalization factor from the raw AET deltas collected in Phase 1.
 //
 // When allPodsTracked is true (every running pod has measured AET data), the
@@ -163,15 +204,21 @@ func (pm *PowerMonitor) resctrlReadDeltas(
 // only approximation is the cpuTimeRatio split of the residual (uncore +
 // system overhead).
 //
-// When allPodsTracked is false (mixed resctrl/ratio pods), the raw deltas are
-// scaled by UsageRatio to match activeEnergy units, and the budget is derived
-// from activeEnergy. This ensures both resctrl and ratio pods share a
-// consistent energy budget.
-func (ra *resctrlAttribution) resctrlComputeBudget(nodeZones NodeZoneUsageMap, usageRatio float64) {
+// When allPodsTracked is false (mixed resctrl/ratio pods), raw AET deltas
+// are used directly against the full RAPL deltaEnergy budget. The non-AET
+// budget (RAPL_delta - sum(raw_AET_core)) is distributed to non-AET pods
+// using their CPU time relative to the hardware-measured non-AET activity
+// (rootActivity - sum(trackedActivity)). This eliminates the cpuUsageRatio
+// scaling that distorts measurements under HT and C-state conditions.
+//
+// Both core_energy and activity files are required for AET operation — they
+// are co-requisite features introduced together on Clearwater Forest and
+// later hardware.
+func (ra *resctrlAttribution) resctrlComputeBudget(nodeZones NodeZoneUsageMap) {
 	if ra.allPodsTracked {
 		ra.computeBudgetAllResctrl(nodeZones)
 	} else {
-		ra.computeBudgetMixed(nodeZones, usageRatio)
+		ra.computeBudgetMixed(nodeZones)
 	}
 }
 
@@ -222,48 +269,79 @@ func (ra *resctrlAttribution) computeBudgetAllResctrl(nodeZones NodeZoneUsageMap
 	}
 }
 
-// computeBudgetMixed scales raw AET deltas by UsageRatio then computes the
-// budget from activeEnergy, matching the existing hybrid model.
-func (ra *resctrlAttribution) computeBudgetMixed(nodeZones NodeZoneUsageMap, usageRatio float64) {
-	// Scale raw deltas by UsageRatio so they are in "active energy" space.
-	for podID, podDeltas := range ra.coreDelta {
-		for pkgIdx, raw := range podDeltas {
-			podDeltas[pkgIdx] = raw * usageRatio
-		}
-		ra.coreDelta[podID] = podDeltas
-	}
-	// Recompute totalCoreByPkg with scaled values.
-	for pkgIdx := range ra.totalCoreByPkg {
-		ra.totalCoreByPkg[pkgIdx] *= usageRatio
-	}
-
+// computeBudgetMixed decomposes RAPL into three disjoint energy pools using
+// the root-level AET core_energy counter:
+//
+//  1. Tracked core:   sum(mon_group core_energy deltas) → directly to AET pods
+//  2. Untracked core: rootCoreDelta - sum(mon_group deltas) → shared among non-AET pods
+//  3. Uncore:         RAPL_delta - rootCoreDelta → shared among ALL pods
+//
+// This decomposition guarantees energy conservation: the three pools sum to
+// exactly the RAPL delta, and each Joule is allocated to exactly one pool.
+//
+// When rootCoreDelta is not available (first cycle or read failure),
+// uncore defaults to RAPL - sum(mon_group core) and untrackedCore to 0.
+func (ra *resctrlAttribution) computeBudgetMixed(nodeZones NodeZoneUsageMap) {
 	for zone, nodeZoneUsage := range nodeZones {
 		if !isPackageZone(zone) {
 			continue
 		}
 
-		var totalCore float64
+		var totalMonGroupCore float64
+		var rootCore float64
 		if pkgIdx, ok := raplZonePackageIndex(zone); ok {
-			totalCore = ra.totalCoreByPkg[pkgIdx]
+			totalMonGroupCore = ra.totalCoreByPkg[pkgIdx]
+			rootCore = ra.rootCoreDelta[pkgIdx]
 		} else {
 			for _, v := range ra.totalCoreByPkg {
-				totalCore += v
+				totalMonGroupCore += v
+			}
+			for _, v := range ra.rootCoreDelta {
+				rootCore += v
 			}
 		}
 
-		raplActiveJoules := nodeZoneUsage.activeEnergy.Joules()
-		if totalCore == 0 {
-			if raplActiveJoules > 0 {
-				ra.uncoreEnergy[zone] = raplActiveJoules
-				ra.coreNormFactor[zone] = 1.0
-			}
+		raplTotalJoules := nodeZoneUsage.deltaEnergy.Joules()
+		if raplTotalJoules == 0 {
 			continue
 		}
-		if raplActiveJoules > totalCore {
-			ra.uncoreEnergy[zone] = raplActiveJoules - totalCore
-			ra.coreNormFactor[zone] = 1.0
+
+		// If root core energy is available, use three-pool decomposition.
+		// Otherwise fall back to two-pool (same as all-resctrl).
+		if rootCore > 0 {
+			// Clamp rootCore to RAPL total (counter timing can cause overshoot).
+			if rootCore > raplTotalJoules {
+				rootCore = raplTotalJoules
+			}
+
+			ra.uncoreEnergy[zone] = raplTotalJoules - rootCore
+
+			untracked := rootCore - totalMonGroupCore
+			if untracked < 0 {
+				untracked = 0
+			}
+			ra.untrackedCore[zone] = untracked
+
+			// Normalize tracked core if it exceeds rootCore (rare timing issue).
+			if totalMonGroupCore > 0 && totalMonGroupCore > rootCore {
+				ra.coreNormFactor[zone] = rootCore / totalMonGroupCore
+			} else {
+				ra.coreNormFactor[zone] = 1.0
+			}
 		} else {
-			ra.coreNormFactor[zone] = raplActiveJoules / totalCore
+			// No root core data: fall back to two-pool decomposition.
+			if totalMonGroupCore == 0 {
+				ra.uncoreEnergy[zone] = raplTotalJoules
+				ra.untrackedCore[zone] = 0
+				ra.coreNormFactor[zone] = 1.0
+			} else if raplTotalJoules > totalMonGroupCore {
+				ra.uncoreEnergy[zone] = raplTotalJoules - totalMonGroupCore
+				ra.untrackedCore[zone] = 0
+				ra.coreNormFactor[zone] = 1.0
+			} else {
+				ra.coreNormFactor[zone] = raplTotalJoules / totalMonGroupCore
+				ra.untrackedCore[zone] = 0
+			}
 		}
 	}
 }

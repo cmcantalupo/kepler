@@ -66,6 +66,11 @@ func (m *MockResctrlMeter) ReadGroupEnergyByZone(id string) (map[string]float64,
 	return args.Get(0).(map[string]float64), args.Error(1)
 }
 
+func (m *MockResctrlMeter) ReadGroupActivityByZone(id string) (map[string]float64, error) {
+	args := m.Called(id)
+	return args.Get(0).(map[string]float64), args.Error(1)
+}
+
 func (m *MockResctrlMeter) GroupExists(id string) bool {
 	args := m.Called(id)
 	return args.Bool(0)
@@ -89,6 +94,12 @@ func createMonitorWithResctrl(
 	mockMeter.On("PrimaryEnergyZone").Return(zones[0], nil)
 	// Setup resctrl mock expectations for Init()
 	resctrlMeter.On("Zones").Return([]string{"mon_PERF_PKG_0"}).Maybe()
+	// Default: root core energy and activity return valid readings. Tests that
+	// need specific values override with targeted expectations.
+	resctrlMeter.On("ReadGroupEnergyByZone", "").Maybe().Return(
+		map[string]float64{"mon_PERF_PKG_0": 0.0}, nil)
+	resctrlMeter.On("ReadGroupActivityByZone", mock.Anything).Maybe().Return(
+		map[string]float64{"mon_PERF_PKG_0": 0.0}, nil)
 	monitor := &PowerMonitor{
 		logger:             logger,
 		cpu:                mockMeter,
@@ -414,9 +425,32 @@ func TestHybridPodPowerAttribution(t *testing.T) {
 	})
 
 	t.Run("mixed_resctrl_and_ratio_pods", func(t *testing.T) {
+		// When some pods have resctrl and others don't, the three-pool mixed mode
+		// decomposes RAPL into tracked core, untracked core, and uncore using the
+		// root-level AET core_energy counter. This guarantees energy conservation.
 		resctrlMeter := &MockResctrlMeter{}
 		resInformer := &MockResourceInformer{}
-		monitor := createMonitorWithResctrl(zones, resctrlMeter, resInformer)
+
+		// Build monitor manually to control root energy mock precisely.
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		fakeClock := testingclock.NewFakeClock(time.Now())
+		mockMeter := &MockCPUPowerMeter{}
+		mockMeter.On("Zones").Return(zones, nil)
+		mockMeter.On("PrimaryEnergyZone").Return(zones[0], nil)
+		resctrlMeter.On("Zones").Return([]string{"mon_PERF_PKG_0"}).Maybe()
+		resctrlMeter.On("ReadGroupActivityByZone", mock.Anything).Maybe().Return(
+			map[string]float64{"mon_PERF_PKG_0": 0.0}, nil)
+		monitor := &PowerMonitor{
+			logger:             logger,
+			cpu:                mockMeter,
+			clock:              fakeClock,
+			resources:          resInformer,
+			maxTerminated:      500,
+			resctrl:            resctrlMeter,
+			resctrlPassiveMode: false,
+			resctrlGroups:      make(map[string]bool),
+		}
+		_ = monitor.Init()
 
 		pod1 := &resource.Pod{
 			ID:           "pod-resctrl",
@@ -451,10 +485,19 @@ func TestHybridPodPowerAttribution(t *testing.T) {
 		resInformer.SetExpectations(t, tr)
 
 		monitor.resctrlGroups["pod-resctrl"] = true
-		resctrlMeter.On("ReadGroupEnergyByZone", "pod-resctrl").Return(map[string]float64{"mon_PERF_PKG_0": 300.0}, nil)
+
+		// Energy: pod-resctrl has 300J cumulative (prev 250J → delta=50J)
+		resctrlMeter.On("ReadGroupEnergyByZone", "pod-resctrl").Return(
+			map[string]float64{"mon_PERF_PKG_0": 300.0}, nil)
+
+		// Root core energy: 380J cumulative (prev 300J → delta=80J system core total)
+		// This means: 80J total core, 50J tracked by mon_groups, 30J untracked
+		resctrlMeter.On("ReadGroupEnergyByZone", "").Return(
+			map[string]float64{"mon_PERF_PKG_0": 380.0}, nil)
 
 		prevSnapshot := NewSnapshot()
 		prevSnapshot.Node = createNodeSnapshotWithDelta(zones, time.Now(), 0.5, 100*Joule)
+		prevSnapshot.Node.AETCoreBaseline = map[int]float64{0: 300.0} // prev root core energy
 		prevSnapshot.Pods["pod-resctrl"] = &Pod{
 			ID:                     "pod-resctrl",
 			Name:                   "resctrl-pod",
@@ -486,21 +529,35 @@ func TestHybridPodPowerAttribution(t *testing.T) {
 		assert.Equal(t, AttributionResctrl, resctrlPod.AttributionSource)
 		assert.Equal(t, AttributionRatio, ratioPod.AttributionSource)
 
-		// Core delta for resctrl pod = 300 - 250 = 50J raw, active = 50 * 0.5 = 25J
-		assert.Equal(t, 25.0, newSnapshot.TotalResctrlCoreEnergyByPkg[0])
+		// Three-pool mixed mode:
+		// mon_group core delta = 300 - 250 = 50J
+		assert.Equal(t, 50.0, newSnapshot.TotalResctrlCoreEnergyByPkg[0])
 
-		// Phase 2: raplActive = 50J, totalCore = 25J → uncore = 25J, normFactor = 1.0
-		// Resctrl pod (package-0): normCore=25J + uncoreShare=25*0.5=12.5J = 37.5J + 10J prev
+		// Phase 2 (computeBudgetMixed):
+		// RAPL delta = 100J, rootCoreDelta = 80J, monGroupCore = 50J
+		// Pool 1 (tracked core):   50J → resctrl pod directly
+		// Pool 2 (untracked core): 80 - 50 = 30J → shared among non-AET pods
+		// Pool 3 (uncore):         100 - 80 = 20J → shared among ALL pods
+		// normFactor = 1.0
+		//
+		// Phase 3:
+		// Resctrl pod: normCore=50*1.0=50J + uncoreShare=20*0.5=10J = 60J
 		pkgZone := zones[0]
-		assert.Equal(t, Energy(95*Joule/2), resctrlPod.Zones[pkgZone].EnergyTotal,
-			"Resctrl pod: 25J core + 12.5J uncore share + 10J prev = 47.5J")
+		assert.Equal(t, Energy(70*Joule), resctrlPod.Zones[pkgZone].EnergyTotal,
+			"Resctrl pod: 50J core + 10J uncore share + 10J prev = 70J")
 
-		// Ratio pod (package-0): only gets uncore share = 25J * 0.5 = 12.5J + 10J prev
-		assert.Equal(t, Energy(45*Joule/2), ratioPod.Zones[pkgZone].EnergyTotal,
-			"Ratio pod on package zone: 12.5J uncore share + 10J prev = 22.5J")
+		// Ratio pod: untrackedCore * (cpuTime/(nodeCPU-aetCPU)) + uncore * cpuTimeRatio
+		// = 30J * (100/(200-100)) + 20J * 0.5
+		// = 30J + 10J = 40J delta + 10J prev = 50J
+		assert.Equal(t, Energy(50*Joule), ratioPod.Zones[pkgZone].EnergyTotal,
+			"Ratio pod: 30J untracked core + 10J uncore share + 10J prev = 50J")
 
-		// Conservation: 37.5J + 12.5J = 50J = raplActive ✓
-		// (both pods have cpuTimeRatio = 100/200 = 0.5)
+		// Conservation: sum(pod deltas) = RAPL delta
+		// resctrl: 60J + ratio: 40J = 100J ✓
+		totalDelta := (resctrlPod.Zones[pkgZone].EnergyTotal - 10*Joule) +
+			(ratioPod.Zones[pkgZone].EnergyTotal - 10*Joule)
+		assert.Equal(t, Energy(100*Joule), totalDelta,
+			"Mixed mode: sum(pod deltas) = RAPL delta = 100J")
 
 		// Non-package zone (core-0): both pods use pure ratio model
 		coreZone := zones[1]
@@ -509,6 +566,10 @@ func TestHybridPodPowerAttribution(t *testing.T) {
 			"Resctrl pod on non-pkg zone: ratio model 25J + 10J prev = 35J")
 		assert.Equal(t, Energy(35*Joule), ratioPod.Zones[coreZone].EnergyTotal,
 			"Ratio pod on non-pkg zone: ratio model 25J + 10J prev = 35J")
+
+		// Root core baseline should be stored on the node for next cycle.
+		assert.Equal(t, 380.0, newSnapshot.Node.AETCoreBaseline[0],
+			"Root core energy cumulative should be stored on node")
 
 		resctrlMeter.AssertExpectations(t)
 	})

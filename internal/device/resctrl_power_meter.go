@@ -65,6 +65,15 @@ type ResctrlPowerMeter interface {
 	// each mon_PERF_PKG corresponds to a different CPU package.
 	ReadGroupEnergyByZone(id string) (map[string]float64, error)
 
+	// ReadGroupActivityByZone reads the cumulative CPU activity (in CPU-seconds,
+	// float64) for each AET zone individually. Returns a map from zone name
+	// (e.g., "mon_PERF_PKG_00") to that zone's cumulative activity counter.
+	// The activity file is exposed by resctrl alongside core_energy when AET is
+	// available. Activity counters measure actual CPU-seconds consumed by the
+	// group's processes, unaffected by HT or C-state distortions.
+	// Returns an error if the activity files are not available (older kernels).
+	ReadGroupActivityByZone(id string) (map[string]float64, error)
+
 	// GroupExists returns true if a mon_group with the given ID exists.
 	GroupExists(id string) bool
 }
@@ -351,7 +360,7 @@ func (r *resctrlPowerMeterImpl) ReadGroupEnergy(id string) (float64, error) {
 
 	var totalEnergy float64
 	for _, zone := range zones {
-		energy, err := r.readZoneEnergy(id, zone)
+		energy, err := r.readZoneFile(id, zone, "core_energy")
 		if err != nil {
 			return 0, fmt.Errorf("failed to read core_energy for group %s zone %s: %w",
 				id, zone, err)
@@ -366,6 +375,21 @@ func (r *resctrlPowerMeterImpl) ReadGroupEnergy(id string) (float64, error) {
 // returning a map from AET zone name to energy in Joules (float64).
 // Each zone corresponds to one CPU package (e.g., "mon_PERF_PKG_00" → package 0).
 func (r *resctrlPowerMeterImpl) ReadGroupEnergyByZone(id string) (map[string]float64, error) {
+	return r.readZoneFileByZone(id, "core_energy")
+}
+
+// ReadGroupActivityByZone reads the cumulative CPU activity for a group,
+// returning a map from AET zone name to activity in CPU-seconds (float64).
+// Each zone corresponds to one CPU package (e.g., "mon_PERF_PKG_00" → package 0).
+// Returns an error if activity files are not available (older kernels or
+// configurations without AET activity support).
+func (r *resctrlPowerMeterImpl) ReadGroupActivityByZone(id string) (map[string]float64, error) {
+	return r.readZoneFileByZone(id, "activity")
+}
+
+// readZoneFileByZone reads a specific metric file from all AET zones for a group,
+// returning a map from zone name to the parsed float64 value.
+func (r *resctrlPowerMeterImpl) readZoneFileByZone(id, filename string) (map[string]float64, error) {
 	if id != "" {
 		if err := validateGroupID(id); err != nil {
 			return nil, err
@@ -381,12 +405,12 @@ func (r *resctrlPowerMeterImpl) ReadGroupEnergyByZone(id string) (map[string]flo
 
 	result := make(map[string]float64, len(zones))
 	for _, zone := range zones {
-		energy, err := r.readZoneEnergy(id, zone)
+		val, err := r.readZoneFile(id, zone, filename)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read core_energy for group %s zone %s: %w",
-				id, zone, err)
+			return nil, fmt.Errorf("failed to read %s for group %s zone %s: %w",
+				filename, id, zone, err)
 		}
-		result[zone] = energy
+		result[zone] = val
 	}
 
 	return result, nil
@@ -402,31 +426,31 @@ func (r *resctrlPowerMeterImpl) GroupExists(id string) bool {
 	return err == nil
 }
 
-// readZoneEnergy reads the core_energy value from a specific AET zone for a group.
-// The kernel AET interface reports core_energy as floating-point Joules
-// (e.g., "94499439.510380"). We return the value as float64 Joules to
-// preserve sub-Joule precision in energy deltas.
-func (r *resctrlPowerMeterImpl) readZoneEnergy(groupID, zone string) (float64, error) {
-	var energyPath string
+// readZoneFile reads a float64 value from a specific metric file in an AET zone
+// for a group. Handles both root-level reads (groupID="" reads from mon_data)
+// and per-group reads (from mon_groups/<id>/mon_data).
+// The kernel AET interface reports counters as floating-point values
+// (e.g., "94499439.510380" for core_energy, "1234.567890" for activity).
+func (r *resctrlPowerMeterImpl) readZoneFile(groupID, zone, filename string) (float64, error) {
+	var filePath string
 	if groupID == "" {
 		// Root level (no group)
-		energyPath = filepath.Join(r.basePath, "mon_data", zone, "core_energy")
+		filePath = filepath.Join(r.basePath, "mon_data", zone, filename)
 	} else {
-		energyPath = filepath.Join(r.basePath, "mon_groups", groupID, "mon_data", zone, "core_energy")
+		filePath = filepath.Join(r.basePath, "mon_groups", groupID, "mon_data", zone, filename)
 	}
 
-	data, err := r.fs.ReadFile(energyPath)
+	data, err := r.fs.ReadFile(filePath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read %s: %w", energyPath, err)
+		return 0, fmt.Errorf("failed to read %s: %w", filePath, err)
 	}
 
 	valueStr := strings.TrimSpace(string(data))
 
-	// The kernel always reports AET core_energy as floating-point Joules.
 	val, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse core_energy %q from %s: %w",
-			valueStr, energyPath, err)
+		return 0, fmt.Errorf("failed to parse %s %q from %s: %w",
+			filename, valueStr, filePath, err)
 	}
 
 	return val, nil
