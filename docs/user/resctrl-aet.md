@@ -19,7 +19,7 @@ package (CPU socket) zones. Non-package zones like DRAM continue to use the
 standard CPU time ratio model.
 
 For implementation details on the hybrid attribution pipeline, see the
-[Power Attribution Guide](../developer/power-attribution-guide.md#resctrlAET-attribution).
+[Power Attribution Guide](../developer/power-attribution-guide.md#resctrlaet-attribution).
 
 ## Requirements
 

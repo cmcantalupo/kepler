@@ -313,10 +313,10 @@ type Snapshot struct {
 	// core energy deltas (Joules, float64) across all pods with resctrl
 	// monitoring groups for that package in the current collection cycle.
 	//
-	// When all pods have resctrl groups (all-resctrl mode), these are raw
-	// AET deltas and the uncore residual is computed from deltaEnergy.
-	// When some pods lack resctrl groups (mixed mode), these are scaled by
-	// cpuUsageRatio for consistency with nodeZoneUsage.activeEnergy.
+	// In both all-resctrl mode (all pods have resctrl groups) and mixed mode
+	// (some pods lack resctrl groups), these values are the raw AET core-energy
+	// deltas summed per package. Any scaling by cpuUsageRatio is applied later
+	// at the per-pod level (e.g., in calculatePodPower), not to this field.
 	TotalResctrlCoreEnergyByPkg map[int]float64
 }
 
