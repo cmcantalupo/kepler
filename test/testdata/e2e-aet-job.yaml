@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: 2026 The Kepler Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# K8s Job to run the AET e2e comparison tests inside a pod.
+# Requires:
+#   - Kepler built at /root/kepler/bin/kepler on the host
+#   - Test binary built at /root/kepler/bin/kepler-e2e.test on the host
+#   - Kepler image (quay.io/sustainable_computing_io/kepler:resctrl-test) available
+#   - stress-ng installed on the host at /usr/bin/stress-ng
+#   - Node with Intel RAPL + resctrl/AET support
+#
+# Build binaries first:
+#   cd /root/kepler
+#   CGO_ENABLED=1 go build -o bin/kepler ./cmd/kepler/
+#   cd test/e2e && CGO_ENABLED=1 go test -c -o ../../bin/kepler-e2e.test .
+#
+# Run:
+#   kubectl apply -f test/testdata/e2e-aet-job.yaml
+#   kubectl logs -f -n kepler job/kepler-aet-e2e
+#   kubectl delete -f test/testdata/e2e-aet-job.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kepler-e2e
+  namespace: kepler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kepler-e2e
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kepler-e2e
+subjects:
+  - kind: ServiceAccount
+    name: kepler-e2e
+    namespace: kepler
+roleRef:
+  kind: ClusterRole
+  name: kepler-e2e
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kepler-aet-e2e
+  namespace: kepler
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: kepler-e2e
+      hostPID: true
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: e2e-runner
+          image: quay.io/sustainable_computing_io/kepler:resctrl-test
+          imagePullPolicy: Never
+          workingDir: /kepler
+          env:
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== AET E2E Test Runner ==="
+              echo "Kepler binary: $(ls -la /kepler/bin/kepler)"
+              echo "Test binary: $(ls -la /kepler/bin/kepler-e2e.test)"
+              echo "Host stress-ng: $(ls -la /host-usr-bin/stress-ng)"
+
+              # Create a wrapper that runs stress-ng using the host's linker
+              # and libraries, avoiding glibc version mismatches.
+              cat > /usr/local/bin/stress-ng <<'WRAPPER'
+              #!/bin/sh
+              exec /host-lib64/ld-linux-x86-64.so.2 --library-path /host-lib64 /host-usr-bin/stress-ng "$@"
+              WRAPPER
+              chmod +x /usr/local/bin/stress-ng
+              echo "stress-ng version: $(stress-ng --version 2>&1)"
+
+              exec /kepler/bin/kepler-e2e.test \
+                -test.v \
+                -test.run "TestAET" \
+                -test.timeout 300s
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+          volumeMounts:
+            - name: kepler-repo
+              mountPath: /kepler
+            - name: procfs
+              mountPath: /proc
+            - name: sysfs
+              mountPath: /sys
+            - name: resctrl
+              mountPath: /sys/fs/resctrl
+            - name: host-usr-bin
+              mountPath: /host-usr-bin
+              readOnly: true
+            - name: host-lib64
+              mountPath: /host-lib64
+              readOnly: true
+
+      volumes:
+        - name: kepler-repo
+          hostPath:
+            path: /root/kepler
+            type: Directory
+        - name: procfs
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: sysfs
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: resctrl
+          hostPath:
+            path: /sys/fs/resctrl
+            type: DirectoryOrCreate
+        - name: host-usr-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: host-lib64
+          hostPath:
+            path: /lib64
+            type: Directory
+

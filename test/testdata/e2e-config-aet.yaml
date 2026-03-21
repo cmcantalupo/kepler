@@ -1,7 +1,8 @@
-# SPDX-FileCopyrightText: 2025 The Kepler Authors
+# SPDX-FileCopyrightText: 2026 The Kepler Authors
 # SPDX-License-Identifier: Apache-2.0
-# Kepler configuration for e2e tests
-# This configuration is optimized for testing on bare-metal systems
+# Kepler configuration for e2e tests with resctrl/AET enabled.
+# Requires Intel Xeon with AET support (Clearwater Forest or later)
+# and the resctrl filesystem mounted at /sys/fs/resctrl.
 log:
   level: debug
   format: text
@@ -9,7 +10,7 @@ monitor:
   interval: 3s
   staleness: 10s
   maxTerminated: 100
-  minTerminatedEnergyThreshold: 1 # Low threshold to catch more processes in tests
+  minTerminatedEnergyThreshold: 1
 host:
   procfs: /proc
   sysfs: /sys
@@ -24,10 +25,12 @@ exporter:
       - pod
 web:
   listenAddresses:
-    - :28282
-# Enable Kubernetes integration for pod-level AET attribution
+    - :28283
 kube:
   enabled: true
   nodeName: ""
   podInformer:
     mode: apiserver
+experimental:
+  resctrl:
+    enabled: true

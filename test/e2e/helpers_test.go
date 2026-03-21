@@ -16,7 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/sustainable-computing-io/kepler/test/common"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -64,6 +69,37 @@ func skipIfRAPLNotReadable(t *testing.T) {
 	}
 }
 
+// ResctrlPath is the path to the resctrl filesystem
+const ResctrlPath = "/sys/fs/resctrl"
+
+// skipIfNoResctrl skips the test if the resctrl filesystem is not available
+// or does not support AET core_energy counters.
+func skipIfNoResctrl(t *testing.T) {
+	t.Helper()
+
+	if _, err := os.Stat(ResctrlPath); os.IsNotExist(err) {
+		t.Skipf("Skipping: resctrl not available at %s", ResctrlPath)
+	}
+
+	// Check for AET core_energy support by looking for mon_data directories
+	monDataPath := filepath.Join(ResctrlPath, "mon_data")
+	entries, err := os.ReadDir(monDataPath)
+	if err != nil {
+		t.Skipf("Skipping: cannot read resctrl mon_data: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "mon_PERF_PKG_") {
+			coreEnergyPath := filepath.Join(monDataPath, e.Name(), "core_energy")
+			if _, err := os.Stat(coreEnergyPath); err == nil {
+				return // AET core_energy is available
+			}
+		}
+	}
+
+	t.Skipf("Skipping: resctrl mon_data has no AET core_energy counters")
+}
+
 // requireE2EPrerequisites checks all common prerequisites for e2e tests
 func requireE2EPrerequisites(t *testing.T) {
 	t.Helper()
@@ -93,6 +129,16 @@ type keplerOption func(*KeplerInstance)
 // withLogOutput sets where to write logs
 func withLogOutput(w io.Writer) keplerOption {
 	return func(k *KeplerInstance) { k.logOutput = w }
+}
+
+// withPort overrides the metrics port
+func withPort(port int) keplerOption {
+	return func(k *KeplerInstance) { k.port = port }
+}
+
+// withConfig overrides the config file path
+func withConfig(path string) keplerOption {
+	return func(k *KeplerInstance) { k.configPath = path }
 }
 
 // startKepler starts Kepler and registers cleanup
@@ -254,6 +300,7 @@ type workloadConfig struct {
 	name       string
 	cpuWorkers int
 	cpuLoad    int
+	cpuMethod  string
 }
 
 // WithWorkloadName sets workload name
@@ -271,6 +318,11 @@ func WithCPULoad(percent int) workloadOption {
 	return func(c *workloadConfig) { c.cpuLoad = percent }
 }
 
+// WithCPUMethod sets the stress-ng CPU stressor method (e.g., "matrixprod", "int64")
+func WithCPUMethod(method string) workloadOption {
+	return func(c *workloadConfig) { c.cpuMethod = method }
+}
+
 // StartWorkload starts a stress workload
 func StartWorkload(t *testing.T, opts ...workloadOption) *Workload {
 	t.Helper()
@@ -283,6 +335,9 @@ func StartWorkload(t *testing.T, opts ...workloadOption) *Workload {
 	args := []string{"--cpu", strconv.Itoa(cfg.cpuWorkers)}
 	if cfg.cpuLoad > 0 && cfg.cpuLoad <= 100 {
 		args = append(args, "--cpu-load", strconv.Itoa(cfg.cpuLoad))
+	}
+	if cfg.cpuMethod != "" {
+		args = append(args, "--cpu-method", cfg.cpuMethod)
 	}
 	args = append(args, "--metrics-brief")
 
@@ -297,8 +352,14 @@ func StartWorkload(t *testing.T, opts ...workloadOption) *Workload {
 
 	w := &Workload{cmd: cmd, name: cfg.name}
 
-	time.Sleep(500 * time.Millisecond)
-	w.workerPIDs = findChildPIDs(cmd.Process.Pid)
+	// Retry child PID discovery — stress-ng may take time to fork workers
+	for attempt := 0; attempt < 10; attempt++ {
+		time.Sleep(500 * time.Millisecond)
+		w.workerPIDs = findChildPIDs(cmd.Process.Pid)
+		if len(w.workerPIDs) >= cfg.cpuWorkers {
+			break
+		}
+	}
 
 	t.Logf("Workload %q started: PID=%d, workers=%v", cfg.name, cmd.Process.Pid, w.workerPIDs)
 
@@ -330,9 +391,18 @@ func findChildPIDs(parentPID int) []int {
 			continue
 		}
 
-		fields := strings.Fields(string(data))
-		if len(fields) >= 4 {
-			if ppid, _ := strconv.Atoi(fields[3]); ppid == parentPID {
+		// The comm field (field 2) is enclosed in parentheses and may
+		// contain spaces (e.g. "(stress-ng-cpu)"). Find the closing
+		// paren to reliably locate subsequent fields.
+		statStr := string(data)
+		closeParen := strings.LastIndex(statStr, ")")
+		if closeParen < 0 {
+			continue
+		}
+		fields := strings.Fields(statStr[closeParen+1:])
+		// fields[0] = state, fields[1] = ppid
+		if len(fields) >= 2 {
+			if ppid, _ := strconv.Atoi(fields[1]); ppid == parentPID {
 				children = append(children, pid)
 			}
 		}
@@ -530,4 +600,171 @@ func WaitForTerminatedProcess(t *testing.T, scraper *common.MetricsScraper, pid 
 
 	t.Logf("Found terminated PID=%d with energy=%.4f J", pid, energy)
 	return energy, true
+}
+
+// --- Kubernetes pod helpers for AET tests ---
+
+const workloadNamespace = "kepler"
+
+// getNodeName returns the Kubernetes node name from the KUBERNETES_NODE_NAME
+// env var (set via downward API) or falls back to os.Hostname().
+func getNodeName(t *testing.T) string {
+	t.Helper()
+	if n := os.Getenv("KUBERNETES_NODE_NAME"); n != "" {
+		return n
+	}
+	h, err := os.Hostname()
+	require.NoError(t, err, "Failed to get hostname")
+	return h
+}
+
+// patchConfigNodeName reads a Kepler config file, sets kube.nodeName to the
+// current node, and writes the result to a temp file. Returns the temp path.
+func patchConfigNodeName(t *testing.T, configPath string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err, "Failed to read config %s", configPath)
+
+	nodeName := getNodeName(t)
+	content := strings.ReplaceAll(string(data),
+		`nodeName: ""`, fmt.Sprintf("nodeName: %q", nodeName))
+
+	tmpFile := filepath.Join(t.TempDir(), filepath.Base(configPath))
+	err = os.WriteFile(tmpFile, []byte(content), 0o600)
+	require.NoError(t, err)
+
+	t.Logf("Patched config %s → %s (nodeName=%s)", configPath, tmpFile, nodeName)
+	return tmpFile
+}
+
+// getK8sClient returns a Kubernetes client using in-cluster config.
+func getK8sClient(t *testing.T) kubernetes.Interface {
+	t.Helper()
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		t.Skipf("Cannot create in-cluster config: %v (test must run inside K8s)", err)
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	require.NoError(t, err)
+	return client
+}
+
+// hostPathDir returns a pointer to HostPathDirectory.
+func hostPathDir() *corev1.HostPathType {
+	t := corev1.HostPathDirectory
+	return &t
+}
+
+// createWorkloadPod creates a stress-ng pod on the current node and waits for
+// it to reach Running state. Cleanup is registered via t.Cleanup.
+func createWorkloadPod(t *testing.T, client kubernetes.Interface, name, method string, workers, cpuLoad int) {
+	t.Helper()
+
+	nodeName := getNodeName(t)
+	cmd := fmt.Sprintf(
+		"/host-lib64/ld-linux-x86-64.so.2 --library-path /host-lib64 "+
+			"/host-usr-bin/stress-ng --cpu %d --cpu-load %d --cpu-method %s --metrics-brief -t 0",
+		workers, cpuLoad, method)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: workloadNamespace,
+			Labels: map[string]string{
+				"app":      "kepler-e2e-workload",
+				"workload": name,
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:      nodeName,
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:            "stress",
+				Image:           "quay.io/sustainable_computing_io/kepler:resctrl-test",
+				ImagePullPolicy: corev1.PullNever,
+				Command:         []string{"/bin/sh", "-c", cmd},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "host-usr-bin", MountPath: "/host-usr-bin", ReadOnly: true},
+					{Name: "host-lib64", MountPath: "/host-lib64", ReadOnly: true},
+				},
+			}},
+			Volumes: []corev1.Volume{
+				{Name: "host-usr-bin", VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/usr/bin", Type: hostPathDir()},
+				}},
+				{Name: "host-lib64", VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/lib64", Type: hostPathDir()},
+				}},
+			},
+		},
+	}
+
+	_, err := client.CoreV1().Pods(workloadNamespace).Create(
+		context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err, "Failed to create workload pod %s", name)
+
+	t.Cleanup(func() {
+		_ = client.CoreV1().Pods(workloadNamespace).Delete(
+			context.Background(), name, metav1.DeleteOptions{})
+		t.Logf("Deleted workload pod %s", name)
+	})
+
+	waitForPodRunning(t, client, name, 60*time.Second)
+	t.Logf("Workload pod %s running on node %s", name, nodeName)
+}
+
+// waitForPodRunning waits until a pod reaches Running phase.
+func waitForPodRunning(t *testing.T, client kubernetes.Interface, name string, timeout time.Duration) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	err := common.WaitForCondition(ctx, 1*time.Second, func() bool {
+		pod, err := client.CoreV1().Pods(workloadNamespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return pod.Status.Phase == corev1.PodRunning
+	})
+	require.NoError(t, err, "Pod %s did not reach Running within %v", name, timeout)
+}
+
+// WaitForPodInMetrics waits for a pod to appear in kepler_pod_cpu_watts.
+func WaitForPodInMetrics(t *testing.T, scraper *common.MetricsScraper, podName string, timeout time.Duration) bool {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	err := common.WaitForCondition(ctx, 2*time.Second, func() bool {
+		metrics, err := scraper.ScrapeMetric("kepler_pod_cpu_watts")
+		if err != nil {
+			return false
+		}
+		for _, m := range metrics {
+			if m.Labels["pod_name"] == podName {
+				return true
+			}
+		}
+		return false
+	})
+	if err != nil {
+		return false
+	}
+
+	t.Logf("Found pod %s in metrics", podName)
+	return true
+}
+
+// FindPodPower returns the total power for a pod from a metrics snapshot.
+func FindPodPower(snapshot *common.MetricsSnapshot, podName string) (power float64, found bool) {
+	for _, m := range snapshot.GetAllWithName("kepler_pod_cpu_watts") {
+		if m.Labels["pod_name"] == podName && m.Value > 0 {
+			power += m.Value
+			found = true
+		}
+	}
+	return power, found
 }
