@@ -28,9 +28,11 @@ For implementation details on the hybrid attribution pipeline, see the
   monitoring was merged in
   [v7.0-rc1](https://github.com/torvalds/linux/commit/a8848c4b43ad00c8a18db080206e3ffa53a08b91).
 - **Mount**: resctrl filesystem mounted at `/sys/fs/resctrl`
+
   ```bash
   mount -t resctrl resctrl /sys/fs/resctrl
   ```
+
 - **AET zones**: AET zone directories (`mon_PERF_PKG_*`) with a `core_energy`
   file must exist under `/sys/fs/resctrl/mon_data/`, and per-group counters
   must appear under
@@ -47,11 +49,11 @@ ls /sys/fs/resctrl/info/PERF_PKG_MON/mon_features
 
 ### CLI Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--experimental.resctrl.enabled` | `false` | Enable resctrl/AET energy attribution |
-| `--experimental.resctrl.base-path` | `/sys/fs/resctrl` | Path to resctrl filesystem |
-| `--experimental.resctrl.passive-mode` | `false` | Discover existing mon_groups instead of creating them |
+| Flag                                  | Default           | Description                                           |
+|---------------------------------------|-------------------|-------------------------------------------------------|
+| `--experimental.resctrl.enabled`      | `false`           | Enable resctrl/AET energy attribution                 |
+| `--experimental.resctrl.base-path`    | `/sys/fs/resctrl` | Path to resctrl filesystem                            |
+| `--experimental.resctrl.passive-mode` | `false`           | Discover existing mon_groups instead of creating them |
 
 ### Config File (YAML)
 
@@ -156,12 +158,12 @@ between pods are consistent.
 
 Only pods with resctrl monitoring groups emit this metric.
 
-| Label | Description |
-|-------|-------------|
-| `pod_id` | Kubernetes pod UID |
-| `pod_name` | Pod name |
-| `pod_namespace` | Pod namespace |
-| `state` | `running` or `terminated` |
+| Label           | Description               |
+|-----------------|---------------------------|
+| `pod_id`        | Kubernetes pod UID        |
+| `pod_name`      | Pod name                  |
+| `pod_namespace` | Pod namespace             |
+| `state`         | `running` or `terminated` |
 
 Example PromQL queries:
 

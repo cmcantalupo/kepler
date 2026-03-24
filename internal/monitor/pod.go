@@ -146,6 +146,9 @@ func (pm *PowerMonitor) calculatePodPower(prev, newSnapshot *Snapshot) error {
 		if len(ra.totalCoreByPkg) > 0 {
 			newSnapshot.TotalResctrlCoreEnergyByPkg = ra.totalCoreByPkg
 		}
+		if len(ra.rootCoreDelta) > 0 {
+			newSnapshot.RootResctrlCoreEnergyDeltaByPkg = ra.rootCoreDelta
+		}
 		// Store root core energy cumulative on the node for next cycle's baseline.
 		if ra.rootCoreCumulative != nil {
 			newSnapshot.Node.AETCoreBaseline = ra.rootCoreCumulative

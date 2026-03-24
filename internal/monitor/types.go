@@ -318,6 +318,12 @@ type Snapshot struct {
 	// deltas summed per package. Any scaling by cpuUsageRatio is applied later
 	// at the per-pod level (e.g., in calculatePodPower), not to this field.
 	TotalResctrlCoreEnergyByPkg map[int]float64
+
+	// RootResctrlCoreEnergyDeltaByPkg maps package index to the root-level
+	// resctrl core_energy delta (Joules, float64) for the current cycle.
+	// The root value is the total socket core energy (RMID 0 + all mon_groups).
+	// Exposed as kepler_node_resctrl_root_core_energy_delta_joules.
+	RootResctrlCoreEnergyDeltaByPkg map[int]float64
 }
 
 // NewSnapshot creates a new Snapshot instance
@@ -399,6 +405,10 @@ func (s *Snapshot) Clone() *Snapshot {
 	if len(s.TotalResctrlCoreEnergyByPkg) > 0 {
 		clone.TotalResctrlCoreEnergyByPkg = make(map[int]float64, len(s.TotalResctrlCoreEnergyByPkg))
 		maps.Copy(clone.TotalResctrlCoreEnergyByPkg, s.TotalResctrlCoreEnergyByPkg)
+	}
+	if len(s.RootResctrlCoreEnergyDeltaByPkg) > 0 {
+		clone.RootResctrlCoreEnergyDeltaByPkg = make(map[int]float64, len(s.RootResctrlCoreEnergyDeltaByPkg))
+		maps.Copy(clone.RootResctrlCoreEnergyDeltaByPkg, s.RootResctrlCoreEnergyDeltaByPkg)
 	}
 
 	return clone

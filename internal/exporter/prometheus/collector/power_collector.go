@@ -66,6 +66,9 @@ type PowerCollector struct {
 	podGPUJoulesDescriptor               *prometheus.Desc
 	podResctrlCoreEnergyJoulesDescriptor *prometheus.Desc // resctrl/AET core energy (emitted for pods with resctrl counter data, which may be stale during transient read failures)
 
+	// Node-level resctrl metrics
+	nodeResctrlRootCoreEnergyDeltaDescriptor *prometheus.Desc
+
 	// GPU device power metrics
 	gpuTotalWattsDescriptor   *prometheus.Desc
 	gpuIdleWattsDescriptor    *prometheus.Desc
@@ -154,14 +157,19 @@ func NewPowerCollector(monitor PowerDataProvider, nodeName string, logger *slog.
 		vmCPUJoulesDescriptor: joulesDesc("vm", "cpu", nodeName, []string{vmID, "vm_name", "hypervisor", "state", zone}),
 		vmCPUWattsDescriptor:  wattsDesc("vm", "cpu", nodeName, []string{vmID, "vm_name", "hypervisor", "state", zone}),
 
-		podCPUJoulesDescriptor: joulesDesc("pod", "cpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state", zone}),
-		podCPUWattsDescriptor:  wattsDesc("pod", "cpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state", zone}),
+		podCPUJoulesDescriptor: joulesDesc("pod", "cpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state", zone, "attribution_source"}),
+		podCPUWattsDescriptor:  wattsDesc("pod", "cpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state", zone, "attribution_source"}),
 		podGPUJoulesDescriptor: joulesDesc("pod", "gpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state"}),
 		podGPUWattsDescriptor:  wattsDesc("pod", "gpu", nodeName, []string{podID, "pod_name", "pod_namespace", "state"}),
 		podResctrlCoreEnergyJoulesDescriptor: prometheus.NewDesc(
 			prometheus.BuildFQName(keplerNS, "pod", "resctrl_core_energy_joules_total"),
 			"Raw cumulative core energy from resctrl/AET hardware in joules (unscaled hardware counter; only present for pods with resctrl monitoring groups)",
 			[]string{podID, "pod_name", "pod_namespace", "state"}, prometheus.Labels{nodeNameLabel: nodeName}),
+
+		nodeResctrlRootCoreEnergyDeltaDescriptor: prometheus.NewDesc(
+			prometheus.BuildFQName(keplerNS, "node", "resctrl_root_core_energy_delta_joules"),
+			"Root-level resctrl core_energy delta per package in joules (total socket core energy from AET: RMID 0 + all mon_groups)",
+			[]string{"package"}, prometheus.Labels{nodeNameLabel: nodeName}),
 
 		// GPU device power metrics (node-level)
 		gpuTotalWattsDescriptor: prometheus.NewDesc(
@@ -206,6 +214,8 @@ func (c *PowerCollector) Describe(ch chan<- *prometheus.Desc) {
 		// node cpu idle
 		ch <- c.nodeCPUIdleJoulesDesc
 		ch <- c.nodeCPUIdleWattsDesc
+		// node resctrl
+		ch <- c.nodeResctrlRootCoreEnergyDeltaDescriptor
 	}
 
 	// process
@@ -278,7 +288,7 @@ func (c *PowerCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if c.metricsLevel.IsNodeEnabled() {
-		c.collectNodeMetrics(ch, snapshot.Node)
+		c.collectNodeMetrics(ch, snapshot.Node, snapshot.RootResctrlCoreEnergyDeltaByPkg)
 	}
 
 	if c.metricsLevel.IsProcessEnabled() {
@@ -308,7 +318,7 @@ func (c *PowerCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // collectNodeMetrics collects node-level power metrics
-func (c *PowerCollector) collectNodeMetrics(ch chan<- prometheus.Metric, node *monitor.Node) {
+func (c *PowerCollector) collectNodeMetrics(ch chan<- prometheus.Metric, node *monitor.Node, rootCoreDelta map[int]float64) {
 	c.mutex.RLock() // locking nodeJoulesDescriptors
 	defer c.mutex.RUnlock()
 
@@ -363,6 +373,16 @@ func (c *PowerCollector) collectNodeMetrics(ch chan<- prometheus.Metric, node *m
 			zoneName, path,
 		)
 
+	}
+
+	// Resctrl root core energy delta per package (only when resctrl is active)
+	for pkgIdx, delta := range rootCoreDelta {
+		ch <- prometheus.MustNewConstMetric(
+			c.nodeResctrlRootCoreEnergyDeltaDescriptor,
+			prometheus.GaugeValue,
+			delta,
+			fmt.Sprintf("%d", pkgIdx),
+		)
 	}
 }
 
@@ -522,6 +542,10 @@ func (c *PowerCollector) collectPodMetrics(ch chan<- prometheus.Metric, state st
 
 	// No need to lock, already done by the calling function
 	for id, pod := range pods {
+		attrSource := string(pod.AttributionSource)
+		if attrSource == "" {
+			attrSource = "ratio"
+		}
 		for zone, usage := range pod.Zones {
 			zoneName := zone.Name()
 			ch <- prometheus.MustNewConstMetric(
@@ -529,7 +553,7 @@ func (c *PowerCollector) collectPodMetrics(ch chan<- prometheus.Metric, state st
 				prometheus.CounterValue,
 				usage.EnergyTotal.Joules(),
 				id, pod.Name, pod.Namespace, state,
-				zoneName,
+				zoneName, attrSource,
 			)
 
 			ch <- prometheus.MustNewConstMetric(
@@ -537,7 +561,7 @@ func (c *PowerCollector) collectPodMetrics(ch chan<- prometheus.Metric, state st
 				prometheus.GaugeValue,
 				usage.Power.Watts(),
 				id, pod.Name, pod.Namespace, state,
-				zoneName,
+				zoneName, attrSource,
 			)
 		}
 

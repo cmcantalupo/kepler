@@ -167,6 +167,15 @@ These metrics provide energy and power information at the node level.
 - **Constant Labels**:
   - `node_name`
 
+#### kepler_node_resctrl_root_core_energy_delta_joules
+
+- **Type**: GAUGE
+- **Description**: Root-level resctrl core_energy delta per package in joules (total socket core energy from AET: RMID 0 + all mon_groups)
+- **Labels**:
+  - `package`
+- **Constant Labels**:
+  - `node_name`
+
 ### Container Metrics
 
 These metrics provide energy and power information for containers.
@@ -349,6 +358,7 @@ These metrics provide energy and power information for pods.
   - `pod_namespace`
   - `state`
   - `zone`
+  - `attribution_source`
 - **Constant Labels**:
   - `node_name`
 
@@ -362,6 +372,7 @@ These metrics provide energy and power information for pods.
   - `pod_namespace`
   - `state`
   - `zone`
+  - `attribution_source`
 - **Constant Labels**:
   - `node_name`
 
@@ -381,6 +392,18 @@ These metrics provide energy and power information for pods.
 
 - **Type**: GAUGE
 - **Description**: Power consumption of gpu at pod level in watts
+- **Labels**:
+  - `pod_id`
+  - `pod_name`
+  - `pod_namespace`
+  - `state`
+- **Constant Labels**:
+  - `node_name`
+
+#### kepler_pod_resctrl_core_energy_joules_total
+
+- **Type**: COUNTER
+- **Description**: Raw cumulative core energy from resctrl/AET hardware in joules (unscaled hardware counter; only present for pods with resctrl monitoring groups)
 - **Labels**:
   - `pod_id`
   - `pod_name`

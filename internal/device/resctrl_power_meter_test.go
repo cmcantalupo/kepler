@@ -545,7 +545,7 @@ func TestReadGroupEnergyParseError(t *testing.T) {
 
 	_, err := meter.ReadGroupEnergy("test-pod")
 	if err == nil {
-		t.Fatal("ReadGroupEnergy() should fail with unparseable value")
+		t.Fatal("ReadGroupEnergy() should fail with unparsable value")
 	}
 	if !strings.Contains(err.Error(), "failed to parse") {
 		t.Errorf("unexpected error: %v", err)
