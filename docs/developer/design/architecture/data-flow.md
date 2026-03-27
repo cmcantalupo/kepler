@@ -289,6 +289,13 @@ func (pm *PowerMonitor) calculatePodPower(prev, current *Snapshot) error {
 }
 ```
 
+> **Resctrl/AET exception**: When the experimental resctrl feature is enabled,
+> pod attribution on package zones uses hardware-measured core energy from AET
+> instead of CPU-time ratios. Processes and containers continue to use the
+> ratio model, so `Pod Energy ≠ Σ(Container Energy)` in that mode. See
+> [Resctrl/AET Attribution](../../power-attribution-guide.md#resctrlaet-attribution)
+> for the three-phase pipeline details.
+
 ### Hierarchical Consistency
 
 The system enforces mathematical relationships across all levels:
@@ -299,6 +306,11 @@ Container Energy = Σ(Container Process Energy Deltas)
 VM Energy = Σ(VM Process Energy Deltas)
 Pod Energy = Σ(Pod Container Energy Deltas)
 ```
+
+> **Note**: With resctrl/AET enabled, the pod invariant diverges because pods
+> use hardware-measured energy. See the
+> [Resctrl/AET Considerations](../../power-attribution-guide.md#resctrlaet-considerations)
+> section in the power attribution guide.
 
 ## Terminated Workload Handling
 

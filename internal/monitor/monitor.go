@@ -55,6 +55,13 @@ type PowerMonitor struct {
 
 	resources resource.Informer
 
+	// Resctrl/AET per-workload core energy monitoring (optional)
+	resctrl              device.ResctrlPowerMeter
+	resctrlPassiveMode   bool
+	resctrlGroups        map[string]bool // set of pod IDs with active resctrl groups
+	resctrlReconciled    bool            // true after first-boot orphan reconciliation
+	prevUnmatchedResctrl int             // previous cycle's unmatched resctrl group count
+
 	// signals when a snapshot has been updated
 	dataCh chan struct{}
 
@@ -109,6 +116,10 @@ func NewPowerMonitor(meter device.CPUPowerMeter, applyOpts ...OptionFn) *PowerMo
 		maxTerminated:                opts.maxTerminated,
 		minTerminatedEnergyThreshold: opts.minTerminatedEnergyThreshold,
 
+		resctrl:            opts.resctrlMeter,
+		resctrlPassiveMode: opts.resctrlPassiveMode,
+		resctrlGroups:      make(map[string]bool),
+
 		collectionCtx:    ctx,
 		collectionCancel: cancel,
 	}
@@ -141,6 +152,15 @@ func (pm *PowerMonitor) Init() error {
 		}
 	} else {
 		pm.logger.Info("No GPU meters configured")
+	}
+
+	// Log resctrl status
+	if pm.resctrlEnabled() {
+		pm.logger.Info("Resctrl/AET power meter configured",
+			"zones", pm.resctrl.Zones(),
+			"passive_mode", pm.resctrlPassiveMode)
+	} else {
+		pm.logger.Info("No resctrl meter configured")
 	}
 
 	// Initialize terminated workload trackers with the primary energy zone and minimum energy threshold
@@ -186,6 +206,12 @@ func (pm *PowerMonitor) Shutdown() error {
 	pm.logger.Info("shutting down monitor")
 	pm.collectionCancel()
 	pm.collectionWg.Wait()
+
+	// Clean up resctrl mon_groups created in active mode so we don't leak
+	// kernel RMIDs across graceful restarts.
+	if pm.resctrlEnabled() && !pm.resctrlPassiveMode {
+		pm.cleanupResctrlGroups()
+	}
 	return nil
 }
 
@@ -392,6 +418,9 @@ func (pm *PowerMonitor) firstReading(newSnapshot *Snapshot) error {
 		return err
 	}
 
+	// Manage resctrl groups after resource refresh (creates/discovers groups for pods)
+	pm.manageResctrlGroups()
+
 	// First read for processes
 	if err := pm.firstProcessRead(newSnapshot); err != nil {
 		return fmt.Errorf(processPowerError, err)
@@ -424,6 +453,9 @@ func (pm *PowerMonitor) calculatePower(prev, newSnapshot *Snapshot) error {
 		pm.logger.Error("snapshot rebuild failed to refresh resources", "error", err)
 		return err
 	}
+
+	// Manage resctrl groups after resource refresh (creates/discovers groups for pods)
+	pm.manageResctrlGroups()
 
 	// Calculate process power
 	if err := pm.calculateProcessPower(prev, newSnapshot); err != nil {

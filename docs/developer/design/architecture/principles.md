@@ -56,6 +56,15 @@ VM Watts = Σ(Process Watts associated with VM)
 Pod Watts = Σ(Container Watts in Pod)
 ```
 
+> **Note (resctrl/AET)**: When the experimental resctrl/AET feature is enabled,
+> pod energy is calculated independently using hardware-measured core energy
+> from AET, while process and container energy continues to use CPU-time
+> ratios. This means `Pod Watts ≠ Σ(Container Watts)` and
+> `Σ(Process Watts) ≠ Node Active Watts` for AET-attributed pods. The
+> `attribution_source` label on pod metrics distinguishes the two models.
+> See [Resctrl/AET Considerations](../../power-attribution-guide.md#resctrlaet-considerations)
+> for details.
+
 ### Implementation Guarantees
 
 - **Atomic Snapshots**: All related data captured at the same instant

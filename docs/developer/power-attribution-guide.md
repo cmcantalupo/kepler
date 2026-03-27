@@ -10,7 +10,8 @@ processes, containers, VMs, and pods running on a system.
 3. [Attribution Examples](#attribution-examples)
 4. [Implementation Overview](#implementation-overview)
 5. [Code Reference](#code-reference)
-6. [Limitations and Considerations](#limitations-and-considerations)
+6. [Resctrl/AET Attribution](#resctrlaet-attribution)
+7. [Limitations and Considerations](#limitations-and-considerations)
 
 ## Bird's Eye View
 
@@ -221,6 +222,192 @@ interval:
 - Pod CPU ratio: 250ms / 1000ms = 25%
 - Pod power: 25% × active power
 
+### Example 5: Hyperthreading and the CPU-Ratio Blind Spot
+
+This example illustrates a structural limitation of CPU-time ratio
+attribution on hyperthreaded systems.
+
+**System:** Intel Xeon, 128 physical cores, HT enabled → 256 logical
+CPUs. Single pod running DGEMM (compute-intensive, saturates all
+physical cores).
+
+DGEMM is ALU-bound and cannot benefit from hyperthreading. Each physical
+core is 100% busy, but the HT sibling sits idle. The processor draws
+close to TDP, yet the OS reports ~50% CPU utilization (128 busy / 256
+logical CPUs).
+
+```text
+RAPL total power:     300 W
+Node CPU usage ratio: 0.50  (128 busy / 256 logical CPUs)
+Active power:         150 W
+Idle power:           150 W
+Pod power:            1.0 × 150 W = 150 W
+```
+
+Half the pod's real power is misclassified as idle and left
+unattributed. This is a structural artifact: the ratio model cannot
+distinguish "physical cores saturated with HT siblings idle" from
+"system genuinely 50% idle."
+
+With resctrl/AET, the `core_energy` counter reflects actual core power
+regardless of logical CPU accounting, sidestepping this error for the
+core energy component.
+
+### Example 6: Three-Pod Resctrl/AET Comparison
+
+This example shows how the same three pods receive different power
+attributions depending on whether Kepler tracks them with hardware AET
+measurements or falls back to CPU-time ratio estimation. The system state
+is identical across all three cases — only the level of resctrl coverage
+changes.
+
+**Common System State (1-second measurement interval):**
+
+- RAPL package-0 energy delta: 100 J → 100 W total
+- Node CPU usage ratio: 0.50
+- Active energy: 50 J, Idle energy: 50 J
+- Node total CPU time delta: 1000 ms
+
+**Three Pods:**
+
+| Pod              | Workload             | CPU Time | CPU Ratio | AET Core Energy |
+|------------------|----------------------|----------|-----------|-----------------|
+| A (web-app)      | HTTP serving         | 200 ms   | 0.20      | 20 J            |
+| B (ml-inference) | AVX-heavy model eval | 500 ms   | 0.50      | 40 J            |
+| C (log-shipper)  | Lightweight sidecar  | 100 ms   | 0.10      | 10 J            |
+| *Other system*   | Kernel threads, etc. | 200 ms   | 0.20      | —               |
+
+Pod B's AET core energy (40 J) is disproportionately high relative to its
+CPU time because AVX-512 inference consumes significantly more power per
+cycle than scalar code. Pod C's core energy (10 J) is proportionally low —
+a mostly-idle sidecar that wakes briefly to flush buffers.
+
+#### Case 1: No Pods Tracked by Resctrl
+
+All pods use the standard CPU-time ratio model. Each pod receives a share
+of **active energy only** — idle energy is not attributed to any pod.
+
+```text
+Pod Power = cpuTimeRatio × ActivePower
+```
+
+| Pod   | Calculation | Power    |
+|-------|-------------|----------|
+| A     | 0.20 × 50 W | **10 W** |
+| B     | 0.50 × 50 W | **25 W** |
+| C     | 0.10 × 50 W | **5 W**  |
+| *Sum* |             | *40 W*   |
+
+Total attributed to pods: 40 W of 50 W active. The remaining 10 W of
+active energy covers non-pod system activity. The 50 W idle energy is
+not distributed.
+
+**Observation:** Pod B (ml-inference) and a hypothetical scalar workload
+with the same CPU time would receive identical power — the ratio model
+cannot distinguish instruction-level power differences.
+
+#### Case 2: Pods A and B Tracked, Pod C Not Tracked
+
+Pods A and B have resctrl monitoring groups with AET data. Pod C does
+not. Kepler selects **mixed mode**, decomposing RAPL into three pools
+using the root-level AET core_energy counter.
+
+Assume the root-level `core_energy` delta (total system core) is 80 J.
+The tracked mon_group deltas sum to 60 J (Pod A: 20 J, Pod B: 40 J).
+
+**Step 1 — Decompose RAPL into three pools:**
+
+```text
+tracked_core   = 20 + 40 = 60 J     (sum of mon_group core deltas)
+untracked_core = 80 − 60 = 20 J     (rootCore − tracked → non-AET pods)
+uncore         = 100 − 80 = 20 J    (RAPL − rootCore → all pods)
+normFactor     = min(1.0, 80/60) = 1.0
+```
+
+**Step 2 — Attribute per pod:**
+
+Resctrl pods receive tracked core + uncore share. Non-AET pods receive
+untracked core share + uncore share. The untracked core denominator is
+total non-AET CPU time (non-AET pods + system processes = 1000 − 700 =
+300 ms), so system threads get their implicit share without it being
+attributed to pods.
+
+| Pod              | Tracked Core    | Untracked Core           | Uncore Share     | Total   | Power      |
+|------------------|-----------------|--------------------------|------------------|---------|------------|
+| A *(resctrl)*    | 20 × 1.0 = 20 J | —                        | 20 × 0.20 = 4 J  | 24 J    | **24 W**   |
+| B *(resctrl)*    | 40 × 1.0 = 40 J | —                        | 20 × 0.50 = 10 J | 50 J    | **50 W**   |
+| C *(ratio-only)* | —               | 20 × (100/300) = 6.67 J  | 20 × 0.10 = 2 J  | 8.67 J  | **8.67 W** |
+| *Other system*   | —               | 20 × (200/300) = 13.33 J | 20 × 0.20 = 4 J  | 17.33 J | *17.33 W*  |
+| *Sum*            | 60 J            | 20 J                     | 20 J             | 100 J   | *100 W*    |
+
+Energy conservation holds: tracked core (60 J) + untracked core (20 J) +
+uncore (20 J) = 100 J = RAPL delta. "Other system" shows the energy
+implicitly consumed by non-pod processes — this energy is not attributed
+to any pod.
+
+#### Case 3: All Three Pods Tracked by Resctrl
+
+Every running pod has a resctrl monitoring group with valid AET deltas.
+Kepler selects **all-resctrl mode**, which operates against the **full
+RAPL delta** (100 J) rather than just active energy. The residual now
+encompasses true uncore energy, idle power, and non-pod system activity.
+
+**Step 1 — Sum raw AET core deltas (no scaling):**
+
+```text
+total_core = 20 + 40 + 10 = 70 J
+```
+
+**Step 2 — Compute residual and normalization factor:**
+
+```text
+residual   = max(0, RAPL_delta − total_core) = max(0, 100 − 70) = 30 J
+normFactor = min(1.0, RAPL_delta / total_core) = min(1.0, 100/70) = 1.0
+```
+
+**Step 3 — Attribute per pod:**
+
+| Pod   | Core (raw)      | Residual Share   | Total | Power    |
+|-------|-----------------|------------------|-------|----------|
+| A     | 20 × 1.0 = 20 J | 30 × 0.20 = 6 J  | 26 J  | **26 W** |
+| B     | 40 × 1.0 = 40 J | 30 × 0.50 = 15 J | 55 J  | **55 W** |
+| C     | 10 × 1.0 = 10 J | 30 × 0.10 = 3 J  | 13 J  | **13 W** |
+| *Sum* |                 |                  |       | *94 W*   |
+
+The remaining 6 J of residual (30 × 0.20) covers non-pod system
+processes. Total: 94 + 6 = 100 J = full RAPL budget. ✓
+
+#### Summary Comparison
+
+| Pod              | Case 1 (ratio) | Case 2 (mixed)    | Case 3 (all-resctrl) |
+|------------------|----------------|-------------------|----------------------|
+| A (web-app)      | 10 W           | 24 W              | 26 W                 |
+| B (ml-inference) | 25 W           | 50 W              | 55 W                 |
+| C (log-shipper)  | 5 W            | 8.67 W            | 13 W                 |
+| **Pod total**    | **40 W**       | **82.67 W**       | **94 W**             |
+| Energy budget    | Active (50 W)  | Full RAPL (100 W) | Full RAPL (100 W)    |
+
+**Key takeaways:**
+
+1. **AET captures instruction-level power differences.** Pod B's AVX-heavy
+   workload consumes more core energy per cycle than scalar code; the
+   ratio model cannot distinguish them.
+
+2. **All-resctrl and mixed modes operate against the full RAPL budget**
+   rather than just active energy. Energy conservation holds in every
+   case — tracked core + untracked core + uncore = RAPL delta.
+
+3. **The magnitude gap between Case 1 and Cases 2–3 is driven by the
+   energy budget, not just by AET precision.** Case 1 distributes only
+   Active energy (50 W), while AET modes distribute the full RAPL delta
+   (100 W). This 2× budget difference is a direct consequence of the
+   example's 50% CPU utilization ratio — at that level, the ratio model
+   classifies half of RAPL as idle and leaves it unattributed. At higher
+   utilization the gap narrows (e.g., at 80% utilization, Active = 80 W
+   and the ratio would be ~1.25×); at lower utilization it widens. Real
+   Kubernetes clusters commonly operate between 30–60% utilization, so a
+   substantial gap is realistic in production.
+
 ## Implementation Overview
 
 ### Architecture Flow
@@ -371,6 +558,239 @@ type NodeUsage struct {
 }
 ```
 
+## Resctrl/AET Attribution
+
+> **User guide**: See [docs/user/resctrl-aet.md](../user/resctrl-aet.md) for
+> configuration, deployment, and metrics.
+
+### Overview
+
+On Intel Xeon processors with Application Energy Telemetry (AET) support,
+Kepler can read per-monitoring-group core energy counters from the Linux resctrl
+filesystem instead of estimating core energy from CPU time ratios. This is an
+experimental feature enabled via `--experimental.resctrl.enabled`.
+
+AET counters are exposed at two levels in the resctrl filesystem:
+
+**Per-group** (for pods with monitoring groups):
+
+```text
+/sys/fs/resctrl/mon_groups/<group>/mon_data/mon_PERF_PKG_*/core_energy
+```
+
+**Root-level** (system-wide total, all processes regardless of group membership):
+
+```text
+/sys/fs/resctrl/mon_data/mon_PERF_PKG_*/core_energy
+```
+
+Each `mon_PERF_PKG_*` directory corresponds to a CPU package (socket). The
+per-group `core_energy` file contains a cumulative Joule counter of core energy
+consumed by the processes assigned to that monitoring group. The root-level
+`core_energy` counter tracks all core energy on the package, including processes
+not assigned to any monitoring group. The three-pool mixed attribution model
+uses both levels: per-group counters for tracked pods, and the root-level
+counter to derive untracked core energy.
+
+### Three-Phase Attribution Pipeline
+
+When resctrl is enabled, pod power attribution in `calculatePodPower()` follows
+a three-phase pipeline instead of the single ratio-model pass:
+
+#### Phase 1 — Read Deltas (`resctrlReadDeltas`)
+
+**File**: `internal/monitor/resctrl.go`
+
+For each pod with a resctrl monitoring group:
+
+1. Read current cumulative AET counter per package
+2. Compute delta against previous snapshot's baseline
+3. Handle counter wraparound (negative delta → treat as zero)
+4. **Seed-only detection**: A pod's first successful AET read is
+   baseline-only — no delta is produced. The pod uses standard ratio
+   attribution for that cycle and contributes meaningful deltas starting
+   from the next cycle.
+
+The result is `coreDelta[podID][pkgIdx]` in raw Joules.
+
+```go
+// Seed detection: only contribute deltas when a previous baseline exists
+if hasPrevBaseline {
+    ra.coreDelta[id] = podDeltas
+    for pkgIdx, d := range podDeltas {
+        ra.totalCoreByPkg[pkgIdx] += d
+    }
+}
+```
+
+The `allPodsTracked` flag is set when:
+
+- A previous snapshot exists (`prev != nil`)
+- Every running pod has a resctrl group
+- Every tracked pod contributed deltas (had a valid baseline)
+
+#### Phase 2 — Compute Budget (`resctrlComputeBudget`)
+
+**File**: `internal/monitor/resctrl.go`
+
+Two modes are selected automatically based on `allPodsTracked`:
+
+**All-resctrl mode** (`computeBudgetAllResctrl`):
+
+When every pod has AET data, raw deltas are used against the total RAPL
+`deltaEnergy` (not scaled by `UsageRatio`):
+
+```text
+residual = max(0, RAPL_deltaEnergy − sum(raw_AET_core))
+normFactor = min(1.0, RAPL_deltaEnergy / sum(raw_AET_core))
+```
+
+Because RAPL and AET counters are read at slightly different times (non-atomic
+reads), the difference `RAPL − sum(AET)` can be negative — AET may report
+more core energy than RAPL reports total energy. This is physically impossible
+but occurs as a measurement timing artifact. The `max(0, ...)` and
+`min(1.0, ...)` clamps handle both cases:
+
+- **Case A: RAPL > sum(AET)** — the normal case. There is real residual energy
+  (uncore, idle, kernel threads). `normFactor = 1.0` (AET values are used
+  as-is), and the positive residual is distributed to all pods by CPU time
+  ratio.
+
+- **Case B: sum(AET) > RAPL** — timing artifact. `normFactor = RAPL / sum(AET)`
+  (less than 1.0), which scales every pod's AET core delta down so the total
+  equals the RAPL budget. `residual = 0` — no uncore budget is allocated
+  because all available energy is accounted for as core energy.
+
+In Case A, the residual includes true uncore energy, idle energy, and energy
+from non-pod system processes (kernel threads, etc.). Because it is typically
+a small fraction of total package energy, the `cpuTimeRatio` split of the
+residual has minimal accuracy impact.
+
+**Mixed mode** (`computeBudgetMixed`):
+
+When some pods lack resctrl data, the root-level AET `core_energy` counter
+is used to decompose RAPL into three disjoint energy pools:
+
+```text
+uncore        = max(0, RAPL_delta − rootCoreDelta)
+untrackedCore = max(0, rootCoreDelta − sum(mon_group_core_deltas))
+normFactor    = min(1.0, rootCoreDelta / sum(mon_group_core_deltas))
+```
+
+As with all-resctrl mode, the `max(0, ...)` and `min(1.0, ...)` clamps handle
+timing artifacts from non-atomic reads of RAPL and AET counters. The same
+Case A / Case B logic applies at each decomposition boundary.
+
+| Pool           | Source                               | Recipients                                             |
+|----------------|--------------------------------------|--------------------------------------------------------|
+| Tracked core   | Each mon_group's `core_energy` delta | Directly to that AET pod                               |
+| Untracked core | `rootCore − Σ monGroupCore`          | Non-AET pods (by relative CPU time among non-AET pods) |
+| Uncore         | `RAPL − rootCore`                    | ALL pods (by `cpuTimeRatio`)                           |
+
+The three pools sum to exactly the RAPL delta, guaranteeing energy
+conservation. When `rootCoreDelta` is unavailable (first cycle), the
+fallback is a two-pool split using `RAPL − Σ monGroupCore`.
+
+**Normalization**: In both modes, the Case A / Case B clamping logic described
+above ensures that `normFactor` scales AET values to fit within the RAPL
+budget while preserving relative proportions between pods.
+
+#### Phase 3 — Attribute (`calculatePodPower` loop)
+
+**File**: `internal/monitor/pod.go`
+
+For each pod × zone combination, one of three branches executes:
+
+| Condition                           | Branch                  | Energy Formula                                                  |
+|-------------------------------------|-------------------------|-----------------------------------------------------------------|
+| Pod has AET deltas + package zone   | Resctrl core            | `normCore + uncore × cpuTimeRatio`                              |
+| Pod lacks AET deltas + package zone | Untracked core + uncore | `untrackedCore × (podCPU / nonAET_CPU) + uncore × cpuTimeRatio` |
+| Non-package zone or no resctrl      | Pure ratio              | `activeEnergy × cpuTimeRatio`                                   |
+
+```go
+// Resctrl pod on package zone:
+normCore := coreDeltaJoules * ra.coreNormFactor[zone]
+uncoreShareJoules := ra.uncoreEnergy[zone] * cpuTimeRatio
+activeEnergy = Energy((normCore + uncoreShareJoules) * float64(Joule))
+
+// Non-resctrl pod on package zone (mixed mode):
+// Gets untracked core share + uncore share
+untrackedShare := ra.untrackedCore[zone] * (p.CPUTimeDelta / nonAETCPUTotal)
+uncoreShare := ra.uncoreEnergy[zone] * cpuTimeRatio
+activeEnergy = Energy((untrackedShare + uncoreShare) * float64(Joule))
+
+// Non-package zone or no resctrl data:
+activeEnergy = Energy(float64(nodeZoneUsage.activeEnergy) * cpuTimeRatio)
+```
+
+Non-resctrl pods receive untracked core energy (the core energy not
+attributed to any monitoring group) plus their share of uncore energy.
+This ensures energy conservation — tracked core + untracked core + uncore
+equals the RAPL delta.
+
+### Attribution Source Tracking
+
+Each pod carries an `AttributionSource` field:
+
+- `AttributionRatio` — energy computed from CPU time ratios (default, and
+  used during seed-only cycles even for pods with resctrl groups)
+- `AttributionResctrl` — energy computed using AET hardware measurements
+  (set only when the pod contributed meaningful AET deltas)
+
+### Multi-Package and Aggregated Zones
+
+RAPL zones can be per-package (`package-0`, `package-1`) or aggregated
+(`package`). The implementation handles both:
+
+- **Per-package zones**: Match AET data by package index extracted from
+  the zone name via `raplZonePackageIndex()`
+- **Aggregated zones**: Sum AET data across all packages
+
+Similarly, AET zone names (`mon_PERF_PKG_0`) are mapped to package indices
+via `aetZonePackageIndex()`.
+
+### Resctrl Group Lifecycle
+
+**File**: `internal/monitor/resctrl.go` (management functions)
+
+- **Active mode**: `syncResctrlGroups()` creates groups for new pods, adds
+  PIDs, and deletes groups for terminated pods. Stale groups that fail to
+  delete are retained for retry on the next cycle.
+- **Passive mode**: `discoverResctrlGroups()` lists existing `mon_groups`
+  and matches names against running pod UUIDs.
+
+### Key Data Structures
+
+```go
+type resctrlAttribution struct {
+    coreDelta          map[string]map[int]float64  // [podID][pkgIdx] → raw Joules delta
+    totalCoreByPkg     map[int]float64             // [pkgIdx] → sum across pods
+    rootCoreDelta      map[int]float64             // [pkgIdx] → root core energy delta
+    rootCoreCumulative map[int]float64             // [pkgIdx] → cumulative (for baseline)
+    uncoreEnergy       map[EnergyZone]float64      // [zone] → RAPL − rootCore (Joules)
+    coreNormFactor     map[EnergyZone]float64      // [zone] → conservation factor
+    untrackedCore      map[EnergyZone]float64      // [zone] → rootCore − Σ monGroupCore
+    allPodsTracked     bool                        // all-resctrl mode flag
+    pods               map[string]*Pod             // pre-built pod entries
+}
+```
+
+The `Pod` struct carries resctrl state:
+
+- `ResctrlCoreEnergyByPkg map[int]float64` — cumulative AET counter per package
+- `AttributionSource` — `AttributionRatio` or `AttributionResctrl`
+
+The `Node` struct carries the root core baseline:
+
+- `AETCoreBaseline map[int]float64` — cumulative root `core_energy` per package
+
+### Interaction with Existing Attribution
+
+The resctrl pipeline is additive — it only affects package zones for pods
+with resctrl data. All other attribution (processes, containers, VMs,
+non-package pod zones) continues to use the standard CPU-time ratio model
+unchanged.
+
 ## Limitations and Considerations
 
 ### CPU Power States and Attribution Accuracy
@@ -382,9 +802,21 @@ accuracy beyond simple CPU time percentages:
 
 - **C0 (Active)**: CPU executing instructions
 - **C1 (Halt)**: CPU stopped but cache coherent
-- **C2-C6+ (Deep Sleep)**: Progressively deeper sleep states
-- **Impact**: Two processes with identical CPU time can have different power
-  footprints based on sleep behavior
+- **C2-C6+ (Deep Sleep)**: Progressively deeper sleep states, drawing
+  near-zero power
+
+Cores in deep C-states accumulate idle ticks in `/proc/stat`, which
+inflates the denominator of `CPUUsageRatio` (active / total). This
+reduces the active energy budget and shifts energy into the unattributed
+idle bucket — even though the sleeping cores draw negligible power.
+
+In practice the effect is modest: the Linux scheduler spreads work across
+cores and constantly wakes idle cores for timer interrupts, kernel
+threads, and kubelet housekeeping. C-state transitions occur at
+microsecond granularity, so over Kepler's collection interval they
+average out. The per-pod `cpuTimeRatio` (busy time / total busy time
+across all processes) is unaffected because sleeping cores contribute
+zero busy time to both numerator and denominator.
 
 #### P-States (Performance States)
 
@@ -450,6 +882,14 @@ Reality: Process B likely consumed more during its burst due to:
 - **Relative comparisons** between similar workload types
 - **Trend analysis** over longer time periods
 
+### How Resctrl/AET Improves Accuracy
+
+On supported hardware, the [resctrl/AET attribution](#resctrlaet-attribution)
+path replaces CPU-time-based core energy estimates with hardware-measured
+per-workload core energy, capturing instruction-mix and frequency-scaling
+differences. Non-core energy (uncore, idle, system overhead) is still
+approximated via CPU time ratios.
+
 ### When to Exercise Caution
 
 - **Mixed workload environments** with varying compute vs I/O patterns
@@ -461,10 +901,84 @@ Reality: Process B likely consumed more during its burst due to:
 ### Key Metrics
 
 - `kepler_node_cpu_watts{}`: Total node power consumption
+- `kepler_node_resctrl_root_core_energy_delta_joules{package}`: Root-level
+  resctrl core energy delta per package (total socket core energy from AET;
+  only present when resctrl is enabled)
 - `kepler_process_cpu_watts{}`: Individual process power
 - `kepler_container_cpu_watts{}`: Container-level power
 - `kepler_vm_cpu_watts{}`: Virtual machine power
-- `kepler_pod_cpu_watts{}`: Kubernetes pod power
+- `kepler_pod_cpu_watts{attribution_source}`: Kubernetes pod power. The
+  `attribution_source` label is `"resctrl"` for AET-attributed pods or
+  `"ratio"` for CPU-time-ratio-attributed pods.
+- `kepler_pod_resctrl_core_energy_joules_total{}`: Raw AET core energy
+  (experimental, only on supported hardware — see
+  [Resctrl/AET Attribution](#resctrlaet-attribution))
+
+### Resctrl/AET Considerations
+
+#### Metric Invariant Changes
+
+Without resctrl, Kepler maintains these invariants:
+
+- `Σ(process energy) ≈ node activeEnergy`
+- `Σ(container energy) ≈ Σ(process energy in container)`
+- `Σ(pod energy) ≈ Σ(container energy in pod)`
+
+When resctrl is enabled, **pod-level metrics use AET hardware measurements
+while process and container metrics continue to use CPU-time ratios**.
+This means:
+
+- `Σ(pod energy)` may differ from `Σ(process energy)` and
+  `Σ(container energy)` because pods use hardware-measured core energy
+  while processes/containers use estimated energy.
+- Pods with `attribution_source="resctrl"` receive hardware-measured core
+  energy plus a CPU-time-ratio share of uncore energy. This is more
+  accurate than the pure ratio model but uses a fundamentally different
+  calculation.
+
+**Recommendation**: When resctrl is enabled, rely on pod-level metrics for
+power analysis. Consider disabling process and container metrics
+(`metricsLevel: pod`) to avoid confusion from inconsistent invariants.
+
+#### Tracked Pod Energy Model
+
+For pods with AET data (`attribution_source="resctrl"`) on package zones,
+the energy formula is:
+
+```text
+pod_energy = (AET_core_delta × normFactor) + (uncore × cpuTimeRatio)
+```
+
+This differs from the standard ratio model (`activeEnergy × cpuTimeRatio`)
+in two important ways:
+
+1. **Core energy** comes from hardware measurement, not CPU-time estimation.
+   This captures instruction-mix differences (e.g., AVX-512 vs scalar code)
+   that CPU time alone cannot distinguish.
+2. **Idle energy** is not separately attributed. The AET core energy counter
+   includes all core energy consumed by the pod's processes, whether from
+   active computation or shallow idle states (C1). Deep idle energy (C6+)
+   is part of the uncore/residual pool distributed by CPU time ratio.
+
+#### System Process Energy in Mixed Mode
+
+In mixed mode (some pods tracked by AET, others not), pool 2 (untracked
+core energy = `rootCore − Σ monGroupCore`) contains core energy from:
+
+- Non-AET pods
+- System processes (kernel threads, kubelet, containerd, sshd, etc.)
+
+The untracked core pool is distributed among non-AET pods using
+`podCPUTime / nonAETCPUTotal` where `nonAETCPUTotal = nodeCPUTime −
+aetCPUTotal`. Since system processes contribute to `nonAETCPUTotal` but
+are not pods, their share of untracked core energy remains **unattributed**
+— it is implicitly absorbed into the denominator without being assigned to
+any pod. This is by design: attributing system overhead to user pods would
+overstate their consumption.
+
+In **active mode** (Kepler manages resctrl groups), all pods have resctrl
+groups, so untracked core energy consists only of system process energy.
+This energy stays unattributed.
 
 ## Conclusion
 
@@ -474,8 +988,8 @@ attribution has inherent limitations due to modern CPU complexity, it offers a
 good balance between accuracy, simplicity, and performance overhead for most
 monitoring and optimization use cases.
 
-The implementation ensures energy conservation, fair proportional distribution,
-and thread-safe concurrent access while minimizing the overhead of continuous
-power monitoring. Understanding both the capabilities and limitations helps
-users make informed decisions about when and how to rely on Kepler's power
-attribution metrics.
+On Intel Xeon processors with AET support (Clearwater Forest and later), the
+experimental resctrl/AET attribution path replaces CPU-time estimates with
+hardware-measured per-workload core energy, improving accuracy for workloads
+with diverse power profiles — particularly those using power-intensive
+instruction sets like AVX-512 on hyperthreading-enabled systems.

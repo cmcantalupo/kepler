@@ -41,6 +41,9 @@ You can configure Kepler by passing flags when starting the service. The followi
 | `--experimental.gpu.enabled`                  | Enable experimental GPU power monitoring                                | `false`                         | `true`, `false`                                                    |
 | `--experimental.gpu.idle-power`               | GPU idle power in Watts (0 = auto-detect)                               | `0`                             | Any non-negative float                                             |
 | `--experimental.gpu.dcgm-endpoint`            | dcgm-exporter metrics endpoint for MIG power attribution                | `""` (auto-discover)            | URL (e.g., `http://10.0.0.1:9400/metrics`)                         |
+| `--experimental.resctrl.enabled`              | Enable experimental resctrl/AET per-workload core energy monitoring     | `false`                         | `true`, `false`                                                    |
+| `--experimental.resctrl.base-path`            | Resctrl filesystem mount point                                          | `/sys/fs/resctrl`               | Any valid absolute path                                            |
+| `--experimental.resctrl.passive-mode`         | Discover existing mon_groups instead of creating them                   | `false`                         | `true`, `false`                                                    |
 
 ### 💡 Examples
 

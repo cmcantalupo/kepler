@@ -2576,6 +2576,50 @@ func TestValidateExperimentalConfig(t *testing.T) {
 			},
 		},
 		expectedErrors: []string{"unreadable Redfish config file"},
+	}, {
+		name: "resctrl valid absolute basePath",
+		config: &Config{
+			Experimental: &Experimental{
+				Resctrl: ExperimentalResctrl{
+					Enabled:  ptr.To(true),
+					BasePath: "/sys/fs/resctrl",
+				},
+			},
+		},
+		expectedErrors: nil,
+	}, {
+		name: "resctrl basePath with trailing slash is normalized",
+		config: &Config{
+			Experimental: &Experimental{
+				Resctrl: ExperimentalResctrl{
+					Enabled:  ptr.To(true),
+					BasePath: "/sys/fs/resctrl/",
+				},
+			},
+		},
+		expectedErrors: nil,
+	}, {
+		name: "resctrl relative basePath rejected",
+		config: &Config{
+			Experimental: &Experimental{
+				Resctrl: ExperimentalResctrl{
+					Enabled:  ptr.To(true),
+					BasePath: "sys/fs/resctrl",
+				},
+			},
+		},
+		expectedErrors: []string{"resctrl base path must be absolute"},
+	}, {
+		name: "resctrl basePath with traversal rejected",
+		config: &Config{
+			Experimental: &Experimental{
+				Resctrl: ExperimentalResctrl{
+					Enabled:  ptr.To(true),
+					BasePath: "/sys/fs/resctrl/../etc",
+				},
+			},
+		},
+		expectedErrors: []string{"resctrl base path contains path traversal"},
 	}}
 
 	for _, tc := range tests {
@@ -2599,4 +2643,20 @@ func TestValidateExperimentalConfig(t *testing.T) {
 			}
 		})
 	}
+
+	// Verify that normalization actually stored the cleaned path
+	t.Run("resctrl basePath normalized in-place", func(t *testing.T) {
+		cfg := &Config{
+			Experimental: &Experimental{
+				Resctrl: ExperimentalResctrl{
+					Enabled:  ptr.To(true),
+					BasePath: "/sys/fs/resctrl/",
+				},
+			},
+		}
+		errs := cfg.validateExperimentalConfig(nil)
+		assert.Empty(t, errs)
+		assert.Equal(t, "/sys/fs/resctrl", cfg.Experimental.Resctrl.BasePath,
+			"trailing slash should be cleaned")
+	})
 }

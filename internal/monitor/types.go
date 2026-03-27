@@ -23,6 +23,18 @@ const (
 	Watt  = device.Watt
 )
 
+// AttributionSource indicates how a pod's energy was attributed.
+type AttributionSource string
+
+const (
+	// AttributionRatio means energy was attributed using CPU time ratio (existing Kepler model).
+	AttributionRatio AttributionSource = "ratio"
+
+	// AttributionResctrl means core energy was directly measured via resctrl/AET,
+	// and uncore energy was attributed using CPU time ratio.
+	AttributionResctrl AttributionSource = "resctrl"
+)
+
 // NodeUsage contains energy consumption data of a node. This is different to Usage in that it has idle/active split
 type NodeUsage struct {
 	EnergyTotal Energy // Cumulative joules counter
@@ -37,6 +49,11 @@ type NodeUsage struct {
 
 	// NOTE: activeEnergy is an internal variable that is used to calculate Resource's energy
 	activeEnergy Energy // Energy used by the Resource running
+
+	// deltaEnergy is the total energy delta for this zone in the current collection
+	// cycle, before the active/idle split. It is used internally by the attribution
+	// logic (for example, to derive active and idle energy components).
+	deltaEnergy Energy
 }
 
 // Usage contains energy consumption data of workloads (Process, Container, VM)
@@ -59,6 +76,13 @@ type Node struct {
 	Timestamp  time.Time        // Timestamp of the last measurement
 	UsageRatio float64          // ratio of usage
 	Zones      NodeZoneUsageMap // Map of zones to usage
+
+	// AETCoreBaseline maps package index to the root-level cumulative
+	// resctrl core_energy counter (Joules). This is read from the root
+	// mon_data (not from any mon_group) and represents total system core
+	// energy as measured by AET. Used in mixed mode to decompose RAPL
+	// into tracked core, untracked core, and uncore pools.
+	AETCoreBaseline map[int]float64
 }
 
 func (n *Node) Clone() *Node {
@@ -68,6 +92,10 @@ func (n *Node) Clone() *Node {
 	ret := *n
 	ret.Zones = make(NodeZoneUsageMap, len(n.Zones))
 	maps.Copy(ret.Zones, n.Zones)
+	if n.AETCoreBaseline != nil {
+		ret.AETCoreBaseline = make(map[int]float64, len(n.AETCoreBaseline))
+		maps.Copy(ret.AETCoreBaseline, n.AETCoreBaseline)
+	}
 	return &ret
 }
 
@@ -202,6 +230,14 @@ type Pod struct {
 	// GPU power attribution (in Watts). Aggregated from container-level GPU power.
 	GPUPower       float64
 	GPUEnergyTotal Energy // Cumulative GPU energy, aggregated from containers
+
+	// Resctrl/AET fields (only populated when resctrl is enabled)
+	// ResctrlCoreEnergyByPkg maps package index to cumulative core energy from
+	// AET (Joules, float64). Each entry corresponds to one mon_PERF_PKG zone.
+	// Keeping per-package values avoids double-counting on multi-socket systems.
+	ResctrlCoreEnergyByPkg map[int]float64
+
+	AttributionSource AttributionSource // How this pod's energy was attributed
 }
 
 func (p *Pod) Clone() *Pod {
@@ -212,6 +248,10 @@ func (p *Pod) Clone() *Pod {
 	ret := *p
 	ret.Zones = make(ZoneUsageMap, len(p.Zones))
 	maps.Copy(ret.Zones, p.Zones)
+	if p.ResctrlCoreEnergyByPkg != nil {
+		ret.ResctrlCoreEnergyByPkg = make(map[int]float64, len(p.ResctrlCoreEnergyByPkg))
+		maps.Copy(ret.ResctrlCoreEnergyByPkg, p.ResctrlCoreEnergyByPkg)
+	}
 	return &ret
 }
 
@@ -268,6 +308,22 @@ type Snapshot struct {
 
 	// GPU power statistics for debugging/monitoring (optional, nil if no GPU)
 	GPUStats []GPUDeviceStats
+
+	// TotalResctrlCoreEnergyByPkg maps package index to the sum of resctrl
+	// core energy deltas (Joules, float64) across all pods with resctrl
+	// monitoring groups for that package in the current collection cycle.
+	//
+	// In both all-resctrl mode (all pods have resctrl groups) and mixed mode
+	// (some pods lack resctrl groups), these values are the raw AET core-energy
+	// deltas summed per package. Any scaling by cpuUsageRatio is applied later
+	// at the per-pod level (e.g., in calculatePodPower), not to this field.
+	TotalResctrlCoreEnergyByPkg map[int]float64
+
+	// RootResctrlCoreEnergyDeltaByPkg maps package index to the root-level
+	// resctrl core_energy delta (Joules, float64) for the current cycle.
+	// The root value is the total socket core energy (RMID 0 + all mon_groups).
+	// Exposed as kepler_node_resctrl_root_core_energy_delta_joules.
+	RootResctrlCoreEnergyDeltaByPkg map[int]float64
 }
 
 // NewSnapshot creates a new Snapshot instance
@@ -343,6 +399,16 @@ func (s *Snapshot) Clone() *Snapshot {
 	if len(s.GPUStats) > 0 {
 		clone.GPUStats = make([]GPUDeviceStats, len(s.GPUStats))
 		copy(clone.GPUStats, s.GPUStats)
+	}
+
+	// Copy per-package resctrl totals
+	if len(s.TotalResctrlCoreEnergyByPkg) > 0 {
+		clone.TotalResctrlCoreEnergyByPkg = make(map[int]float64, len(s.TotalResctrlCoreEnergyByPkg))
+		maps.Copy(clone.TotalResctrlCoreEnergyByPkg, s.TotalResctrlCoreEnergyByPkg)
+	}
+	if len(s.RootResctrlCoreEnergyDeltaByPkg) > 0 {
+		clone.RootResctrlCoreEnergyDeltaByPkg = make(map[int]float64, len(s.RootResctrlCoreEnergyDeltaByPkg))
+		maps.Copy(clone.RootResctrlCoreEnergyDeltaByPkg, s.RootResctrlCoreEnergyDeltaByPkg)
 	}
 
 	return clone

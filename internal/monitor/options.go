@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sustainable-computing-io/kepler/internal/device"
 	"github.com/sustainable-computing-io/kepler/internal/device/gpu"
 	"github.com/sustainable-computing-io/kepler/internal/resource"
 	"k8s.io/utils/clock"
@@ -21,6 +22,10 @@ type Opts struct {
 	maxStaleness                 time.Duration
 	maxTerminated                int
 	minTerminatedEnergyThreshold Energy
+
+	// Resctrl/AET options
+	resctrlMeter       device.ResctrlPowerMeter
+	resctrlPassiveMode bool
 }
 
 // NewConfig returns a new Config with defaults set
@@ -93,5 +98,20 @@ func WithMinTerminatedEnergyThreshold(threshold Energy) OptionFn {
 func WithGPUPowerMeters(meters []gpu.GPUPowerMeter) OptionFn {
 	return func(o *Opts) {
 		o.gpuMeters = meters
+	}
+}
+
+// WithResctrlMeter sets the resctrl power meter for per-workload AET core energy monitoring.
+func WithResctrlMeter(meter device.ResctrlPowerMeter) OptionFn {
+	return func(o *Opts) {
+		o.resctrlMeter = meter
+	}
+}
+
+// WithResctrlPassiveMode enables passive mode for resctrl group discovery.
+// In passive mode, Kepler discovers existing mon_groups instead of creating them.
+func WithResctrlPassiveMode(passive bool) OptionFn {
+	return func(o *Opts) {
+		o.resctrlPassiveMode = passive
 	}
 }

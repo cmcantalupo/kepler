@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,9 @@ const (
 
 	// ExperimentalGPUFeature represents GPU power monitoring (experimental)
 	ExperimentalGPUFeature Feature = "gpu"
+
+	// ExperimentalResctrlFeature represents resctrl/AET per-workload core energy monitoring (experimental)
+	ExperimentalResctrlFeature Feature = "resctrl"
 )
 
 // Config represents the complete application configuration
@@ -181,11 +185,25 @@ type (
 		DCGMEndpoint string `yaml:"dcgmEndpoint"`
 	}
 
+	// ExperimentalResctrl contains resctrl/AET per-workload core energy monitoring settings
+	ExperimentalResctrl struct {
+		// Enabled controls whether resctrl power monitoring is enabled
+		Enabled *bool `yaml:"enabled"`
+
+		// BasePath is the resctrl filesystem mount point (default: /sys/fs/resctrl)
+		BasePath string `yaml:"basePath"`
+
+		// PassiveMode discovers existing mon_groups instead of creating them.
+		// Use when an external daemon manages resctrl groups.
+		PassiveMode *bool `yaml:"passiveMode"`
+	}
+
 	// Experimental contains experimental features (no stability guarantees)
 	Experimental struct {
-		Platform Platform        `yaml:"platform"`
-		Hwmon    Hwmon           `yaml:"hwmon"`
-		GPU      ExperimentalGPU `yaml:"gpu"`
+		Platform Platform            `yaml:"platform"`
+		Hwmon    Hwmon               `yaml:"hwmon"`
+		GPU      ExperimentalGPU     `yaml:"gpu"`
+		Resctrl  ExperimentalResctrl `yaml:"resctrl"`
 	}
 
 	Config struct {
@@ -298,6 +316,11 @@ const (
 	ExperimentalGPUEnabledFlag      = "experimental.gpu.enabled"
 	ExperimentalGPUIdlePowerFlag    = "experimental.gpu.idle-power"
 	ExperimentalGPUDCGMEndpointFlag = "experimental.gpu.dcgm-endpoint"
+
+	// Experimental Resctrl flags
+	ExperimentalResctrlEnabledFlag     = "experimental.resctrl.enabled"
+	ExperimentalResctrlBasePathFlag    = "experimental.resctrl.base-path"
+	ExperimentalResctrlPassiveModeFlag = "experimental.resctrl.passive-mode"
 
 // WARN:  dev settings shouldn't be exposed as flags as flags are intended for end users
 )
@@ -462,6 +485,11 @@ func RegisterFlags(app *kingpin.Application) ConfigUpdaterFn {
 	gpuIdlePower := app.Flag(ExperimentalGPUIdlePowerFlag, "GPU idle power in Watts (0 = auto-detect from idle observations)").Default("0").Float64()
 	gpuDCGMEndpoint := app.Flag(ExperimentalGPUDCGMEndpointFlag, "dcgm-exporter metrics endpoint URL for MIG power attribution (auto-discovered if empty)").Default("").String()
 
+	// experimental resctrl
+	resctrlEnabled := app.Flag(ExperimentalResctrlEnabledFlag, "Enable experimental resctrl/AET per-workload core energy monitoring").Default("false").Bool()
+	resctrlBasePath := app.Flag(ExperimentalResctrlBasePathFlag, "Resctrl filesystem mount point").Default("/sys/fs/resctrl").String()
+	resctrlPassiveMode := app.Flag(ExperimentalResctrlPassiveModeFlag, "Discover existing mon_groups instead of creating them").Default("false").Bool()
+
 	return func(cfg *Config) error {
 		// Logging settings
 		if flagsSet[LogLevelFlag] {
@@ -536,6 +564,9 @@ func RegisterFlags(app *kingpin.Application) ConfigUpdaterFn {
 
 		// Apply experimental GPU settings
 		applyGPUConfig(cfg, flagsSet, gpuEnabled, gpuIdlePower, gpuDCGMEndpoint)
+
+		// Apply experimental resctrl settings
+		applyResctrlConfig(cfg, flagsSet, resctrlEnabled, resctrlBasePath, resctrlPassiveMode)
 
 		cfg.sanitize()
 		return cfg.Validate()
@@ -688,6 +719,40 @@ func applyGPUConfig(cfg *Config, flagsSet map[string]bool, enabled *bool, idlePo
 	}
 }
 
+// applyResctrlConfig applies resctrl configuration from flags
+func applyResctrlConfig(cfg *Config, flagsSet map[string]bool, enabled *bool, basePath *string, passiveMode *bool) {
+	// Early exit if no resctrl flags are set and config file does not have experimental section
+	if !hasResctrlFlags(flagsSet) && cfg.Experimental == nil {
+		return
+	}
+
+	// Initialize experimental section if needed
+	if cfg.Experimental == nil {
+		cfg.Experimental = &Experimental{}
+	}
+
+	resctrl := &cfg.Experimental.Resctrl
+
+	if flagsSet[ExperimentalResctrlEnabledFlag] {
+		resctrl.Enabled = enabled
+	}
+
+	if flagsSet[ExperimentalResctrlBasePathFlag] {
+		resctrl.BasePath = *basePath
+	}
+
+	if flagsSet[ExperimentalResctrlPassiveModeFlag] {
+		resctrl.PassiveMode = passiveMode
+	}
+}
+
+// hasResctrlFlags returns true if any resctrl experimental flags are set
+func hasResctrlFlags(flagsSet map[string]bool) bool {
+	return flagsSet[ExperimentalResctrlEnabledFlag] ||
+		flagsSet[ExperimentalResctrlBasePathFlag] ||
+		flagsSet[ExperimentalResctrlPassiveModeFlag]
+}
+
 // resolveNodeName resolves the node name using the following precedence:
 // 1. CLI flag / config.yaml (--experimental.platform.redfish.node-name)
 // 2. Kubernetes node name
@@ -736,6 +801,11 @@ func (c *Config) IsFeatureEnabled(feature Feature) bool {
 			return false
 		}
 		return ptr.Deref(c.Experimental.GPU.Enabled, false)
+	case ExperimentalResctrlFeature:
+		if c.Experimental == nil {
+			return false
+		}
+		return ptr.Deref(c.Experimental.Resctrl.Enabled, false)
 	default:
 		return false
 	}
@@ -759,6 +829,11 @@ func (c *Config) experimentalFeatureEnabled() bool {
 
 	// Check if GPU is enabled
 	if ptr.Deref(c.Experimental.GPU.Enabled, false) {
+		return true
+	}
+
+	// Check if Resctrl is enabled
+	if ptr.Deref(c.Experimental.Resctrl.Enabled, false) {
 		return true
 	}
 	// Add checks for future experimental features here
@@ -796,6 +871,9 @@ func (c *Config) sanitize() {
 	for i := range c.Experimental.Hwmon.Zones {
 		c.Experimental.Hwmon.Zones[i] = strings.TrimSpace(c.Experimental.Hwmon.Zones[i])
 	}
+
+	// Sanitize Resctrl fields
+	c.Experimental.Resctrl.BasePath = strings.TrimSpace(c.Experimental.Resctrl.BasePath)
 
 	// If all experimental features are disabled, set experimental to nil to hide it
 	if !c.experimentalFeatureEnabled() {
@@ -929,6 +1007,35 @@ func (c *Config) validateExperimentalConfig(validationSkipped map[SkipValidation
 		}
 
 		errs = append(errs, validateDCGMEndpoint(c.Experimental.GPU.DCGMEndpoint)...)
+	}
+
+	// Validate resctrl basePath: must be absolute and must not contain
+	// path traversal components. This prevents misconfigured or
+	// adversarial basePath values from directing writes to arbitrary
+	// filesystem locations.
+	if c.IsFeatureEnabled(ExperimentalResctrlFeature) {
+		bp := c.Experimental.Resctrl.BasePath
+		if bp == "" {
+			bp = "/sys/fs/resctrl"
+		}
+		clean := filepath.Clean(bp)
+		if !filepath.IsAbs(clean) {
+			errs = append(errs, fmt.Sprintf("resctrl base path must be absolute: %q", bp))
+		} else {
+			hasTraversal := false
+			for _, elem := range strings.Split(bp, string(os.PathSeparator)) {
+				if elem == ".." {
+					errs = append(errs, fmt.Sprintf("resctrl base path contains path traversal (..): %q", bp))
+					hasTraversal = true
+					break
+				}
+			}
+			// Store the normalized path so downstream code operates on a
+			// canonical, traversal-free path, but only if validation passed.
+			if !hasTraversal {
+				c.Experimental.Resctrl.BasePath = clean
+			}
+		}
 	}
 
 	return errs
